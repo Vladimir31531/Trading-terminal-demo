@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.rsbuild/
+*.log
+*.csv
+!tests/fixtures/*.csv
+.qa/
+.data/
