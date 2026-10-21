@@ -218,12 +218,16 @@ button:disabled {
   font-size: 9px;
   line-height: 1;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.instrument-edit {
+.instrument-edit,
+.instrument-delete {
   color: #888;
   flex-shrink: 0;
 }
-.instrument-edit:hover {
+.instrument-edit:hover,
+.instrument-delete:hover {
   color: #171717;
   background: #ddd;
 }
@@ -1156,10 +1160,12 @@ button:disabled {
   .instrument-row {
     padding-right: 2px;
   }
-  .instrument-edit {
+  .instrument-edit,
+  .instrument-delete {
     width: 21px;
   }
-  .instrument-edit svg {
+  .instrument-edit svg,
+  .instrument-delete svg {
     width: 11px;
     height: 11px;
   }

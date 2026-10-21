@@ -210,6 +210,12 @@ export const marketRepository: MarketRepository = {
     );
   },
 
+  async deleteInstrument(id) {
+    await request(`/api/instruments/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  },
+
   loadCandles(datasetId, timeframe, before, limit = DEFAULT_PAGE_SIZE, after) {
     if (!Number.isInteger(limit) || limit < 1)
       return Promise.reject(

@@ -7,8 +7,10 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Trash2,
 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
+import { DeleteInstrumentDialog } from './components/DeleteInstrumentDialog';
 import { InstrumentDialog } from './components/InstrumentDialog';
 import { MarketChart } from './components/MarketChart';
 import { Button } from './components/ui/button';
@@ -35,6 +37,7 @@ export default function App() {
   const [error, setError] = useState<string>();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingInstrument, setEditingInstrument] = useState<Instrument>();
+  const [deletingInstrument, setDeletingInstrument] = useState<Instrument>();
   const selected = instruments.find((item) => item.id === selectedId);
 
   const refresh = useCallback(async (preferredId?: string) => {
@@ -76,6 +79,13 @@ export default function App() {
   function openImport(instrument?: Instrument) {
     setEditingInstrument(instrument);
     setDialogOpen(true);
+  }
+
+  function removeInstrument(id: string) {
+    setInstruments((current) => current.filter((item) => item.id !== id));
+    setSelectedId((current) =>
+      current === id ? instruments.find((item) => item.id !== id)?.id : current,
+    );
   }
 
   async function retry() {
@@ -171,6 +181,16 @@ export default function App() {
                       onClick={() => openImport(instrument)}
                     >
                       <Pencil size={13} />
+                    </Button>
+                    <Button
+                      className="instrument-delete"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={`Удалить ${instrument.ticker}`}
+                      title="Удалить инструмент"
+                      onClick={() => setDeletingInstrument(instrument)}
+                    >
+                      <Trash2 size={13} />
                     </Button>
                   </li>
                 ))}
@@ -307,6 +327,15 @@ export default function App() {
         repository={marketRepository}
         onSaved={refresh}
       />
+      {deletingInstrument && (
+        <DeleteInstrumentDialog
+          key={deletingInstrument.id}
+          instrument={deletingInstrument}
+          repository={marketRepository}
+          onClose={() => setDeletingInstrument(undefined)}
+          onDeleted={removeInstrument}
+        />
+      )}
     </div>
   );
 }

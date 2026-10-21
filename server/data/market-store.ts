@@ -21,11 +21,12 @@ import {
   TIMEFRAMES,
   type Timeframe,
 } from '../../src/domain/market';
+import { pricePrecision } from '../../src/domain/price-precision';
 
 const READ_CHUNK_BYTES = 1024 * 1024;
 const MAX_PAGE_SIZE = 5000;
 const INSTRUMENT_COLUMNS =
-  'id, ticker, datasetId, fileName, fileSize, rowCount, firstTime, lastTime, createdAt';
+  'id, ticker, datasetId, fileName, fileSize, rowCount, firstTime, lastTime, createdAt, pricePrecision';
 
 export class MarketDataError extends Error {
   constructor(
@@ -69,6 +70,18 @@ interface ImportStats {
   rowCount: number;
   firstTime: number;
   lastTime: number;
+  pricePrecision: number;
+}
+
+function candlePricePrecision(
+  candle: Pick<Candle, 'open' | 'high' | 'low' | 'close'>,
+): number {
+  return Math.max(
+    pricePrecision(candle.open),
+    pricePrecision(candle.high),
+    pricePrecision(candle.low),
+    pricePrecision(candle.close),
+  );
 }
 
 function assertNotCancelled(signal?: AbortSignal): void {
@@ -126,7 +139,8 @@ export class LocalMarketStore {
         rowCount INTEGER NOT NULL,
         firstTime REAL NOT NULL,
         lastTime REAL NOT NULL,
-        createdAt INTEGER NOT NULL
+        createdAt INTEGER NOT NULL,
+        pricePrecision INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS candles (
         datasetId TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
@@ -143,6 +157,12 @@ export class LocalMarketStore {
         json TEXT NOT NULL
       );
     `);
+    const columns = this.db
+      .query<{ name: string }, []>('PRAGMA table_info(instruments)')
+      .all();
+    if (!columns.some((column) => column.name === 'pricePrecision')) {
+      this.db.run('ALTER TABLE instruments ADD COLUMN pricePrecision INTEGER');
+    }
     if (recoverIncomplete) this.recoverIncompleteImports();
   }
 
@@ -158,11 +178,38 @@ export class LocalMarketStore {
   }
 
   listInstruments(): Instrument[] {
+    this.backfillPricePrecision();
     return this.db
       .query<Instrument, []>(
         `SELECT ${INSTRUMENT_COLUMNS} FROM instruments ORDER BY createdAt, id`,
       )
       .all();
+  }
+
+  private backfillPricePrecision(): void {
+    const instruments = this.db
+      .query<Pick<Instrument, 'id' | 'datasetId'>, []>(
+        'SELECT id, datasetId FROM instruments WHERE pricePrecision IS NULL',
+      )
+      .all();
+    if (!instruments.length) return;
+    const candles = this.db.query<
+      Pick<Candle, 'open' | 'high' | 'low' | 'close'>,
+      [string]
+    >(
+      "SELECT open, high, low, close FROM candles WHERE datasetId = ? AND timeframe = '1m'",
+    );
+    const update = this.db.query(
+      'UPDATE instruments SET pricePrecision = ? WHERE id = ? AND datasetId = ? AND pricePrecision IS NULL',
+    );
+    for (const instrument of instruments) {
+      let precision = 0;
+      for (const candle of candles.iterate(instrument.datasetId)) {
+        precision = Math.max(precision, candlePricePrecision(candle));
+        if (precision === 8) break;
+      }
+      update.run(precision, instrument.id, instrument.datasetId);
+    }
   }
 
   renameInstrument(id: string, ticker: string): void {
@@ -174,6 +221,18 @@ export class LocalMarketStore {
       );
     if (!updated.changes)
       throw new MarketDataError('Инструмент больше не существует.', 404);
+  }
+
+  deleteInstrument(id: string): void {
+    this.db
+      .transaction(() => {
+        const instrument = this.instrument(id);
+        this.db.query('DELETE FROM instruments WHERE id = ?').run(id);
+        this.db
+          .query('DELETE FROM datasets WHERE id = ?')
+          .run(instrument.datasetId);
+      })
+      .immediate();
   }
 
   async importInstrument(
@@ -243,10 +302,11 @@ export class LocalMarketStore {
         }
         this.db
           .query(`
-          INSERT INTO instruments (${INSTRUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO instruments (${INSTRUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET ticker=excluded.ticker, datasetId=excluded.datasetId,
             fileName=excluded.fileName, fileSize=excluded.fileSize, rowCount=excluded.rowCount,
-            firstTime=excluded.firstTime, lastTime=excluded.lastTime
+            firstTime=excluded.firstTime, lastTime=excluded.lastTime,
+            pricePrecision=excluded.pricePrecision
         `)
           .run(
             instrument.id,
@@ -258,6 +318,7 @@ export class LocalMarketStore {
             instrument.firstTime,
             instrument.lastTime,
             instrument.createdAt,
+            stats.pricePrecision,
           );
         if (existing)
           this.db
@@ -404,6 +465,7 @@ export class LocalMarketStore {
       let rowCount = 0;
       let firstTime: number | undefined;
       let previousTime: number | undefined;
+      let precision = 0;
       let parser: Papa.Parser | undefined;
       let settled = false;
       const cleanUp = (): void => {
@@ -450,6 +512,9 @@ export class LocalMarketStore {
               const candle = validate(() =>
                 parseCsvCandle(row, rowCount + 2, previousTime),
               );
+              if (precision < 8) {
+                precision = Math.max(precision, candlePricePrecision(candle));
+              }
               firstTime ??= candle.time;
               previousTime = candle.time;
               rowCount++;
@@ -479,7 +544,12 @@ export class LocalMarketStore {
             insertBatch(aggregator.flush());
             settled = true;
             cleanUp();
-            resolve({ rowCount, firstTime, lastTime: previousTime });
+            resolve({
+              rowCount,
+              firstTime,
+              lastTime: previousTime,
+              pricePrecision: precision,
+            });
           } catch (error) {
             fail(error);
           }

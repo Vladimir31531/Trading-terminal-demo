@@ -1,14 +1,35 @@
 import type { Candle } from '../domain/market';
 
 export const MAX_CACHED_CANDLES = 3200;
+const HISTORY_THRESHOLD = 80;
 
 export type HistoryDirection = 'older' | 'newer';
+
+/** Load only the edge that the viewport is approaching. */
+export function historyLoadDirection(
+  range: { from: number; to: number },
+  previous: { from: number; to: number } | null,
+  count: number,
+  available: { older: boolean; newer: boolean },
+): HistoryDirection | undefined {
+  if (!previous) return undefined;
+  const olderOverflow = HISTORY_THRESHOLD - range.from;
+  const newerOverflow = range.to - (count - HISTORY_THRESHOLD);
+  const older =
+    available.older && olderOverflow > 0 && range.from < previous.from;
+  const newer = available.newer && newerOverflow > 0 && range.to > previous.to;
+  if (older && newer) return olderOverflow >= newerOverflow ? 'older' : 'newer';
+  if (older) return 'older';
+  if (newer) return 'newer';
+  return undefined;
+}
 
 /** Keep the page being approached and release the far end of the chart history. */
 export function mergeHistoryWindow(
   current: Candle[],
   page: Candle[],
   direction: HistoryDirection,
+  visibleRange?: { from: number; to: number } | null,
 ) {
   const combined =
     direction === 'older' ? [...page, ...current] : [...current, ...page];
@@ -21,5 +42,10 @@ export function mergeHistoryWindow(
     logicalOffset: (direction === 'older' ? page.length : 0) - removedLeft,
     removedLeft,
     removedRight,
+    preservesViewport:
+      !visibleRange ||
+      (removedLeft <= Math.max(0, Math.floor(visibleRange.from)) &&
+        removedRight <=
+          Math.max(0, current.length - 1 - Math.ceil(visibleRange.to))),
   };
 }

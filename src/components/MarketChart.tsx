@@ -11,6 +11,7 @@ import {
 import type { MarketRepository } from '../application/market-repository';
 import { useMarketChart } from '../chart/use-market-chart';
 import type { Instrument, Timeframe } from '../domain/market';
+import { ChartRuler } from './ChartRuler';
 import { Button } from './ui/button';
 
 const numberFormat = new Intl.NumberFormat('en-US', {
@@ -124,7 +125,7 @@ export function MarketChart({ instrument, timeframe, repository }: Props) {
           <Button
             variant={state.crosshair ? 'secondary' : 'ghost'}
             size="icon"
-            title="Перекрестие · нажатие колёсика мыши"
+            title="Перекрестие · колёсико мыши. Линейка · перетаскивание левой кнопкой"
             aria-label="Перекрестие"
             aria-pressed={state.crosshair}
             disabled={state.loading}
@@ -166,7 +167,9 @@ export function MarketChart({ instrument, timeframe, repository }: Props) {
             </>
           )}
         </div>
-        <div ref={state.container} className="chart-canvas" />
+        <div ref={state.container} className="chart-canvas">
+          {state.measurement && <ChartRuler measurement={state.measurement} />}
+        </div>
         {state.loading && (
           <div className="chart-loading" role="status">
             <LoaderCircle className="size-5 animate-spin" />

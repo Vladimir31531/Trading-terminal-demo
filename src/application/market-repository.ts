@@ -19,6 +19,7 @@ export interface MarketRepository {
     signal?: AbortSignal,
   ): Promise<Instrument>;
   renameInstrument(id: string, ticker: string): Promise<void>;
+  deleteInstrument(id: string): Promise<void>;
   loadCandles(
     datasetId: string,
     timeframe: Timeframe,

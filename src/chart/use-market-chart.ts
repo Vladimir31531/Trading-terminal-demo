@@ -11,15 +11,31 @@ import {
   type Drawing,
   type DrawingKind,
   DrawingManager,
+  makeCoords,
+  type OHLC,
 } from 'lightweight-charts-drawing';
 import { useEffect, useRef, useState } from 'react';
 import type { MarketRepository } from '../application/market-repository';
 import type { Candle, Instrument, Timeframe } from '../domain/market';
-import { type HistoryDirection, mergeHistoryWindow } from './history-window';
+import { pricePrecision as decimalPlaces } from '../domain/price-precision';
+import { bindChartGestures } from './chart-gestures';
+import { DaySeparators } from './day-separators';
+import { waitForHistoryIdle } from './history-idle';
+import {
+  type HistoryDirection,
+  historyLoadDirection,
+  MAX_CACHED_CANDLES,
+  mergeHistoryWindow,
+} from './history-window';
+import type { RulerMeasurement } from './ruler';
+import {
+  loadViewportHistory,
+  type TimeRange,
+  viewportLogicalRange,
+} from './viewport';
 
 const VISIBLE_BARS = 110;
 const PAGE_SIZE = 800;
-const HISTORY_THRESHOLD = 80;
 const utcDate = new Intl.DateTimeFormat('ru-RU', {
   timeZone: 'UTC',
   year: 'numeric',
@@ -34,6 +50,7 @@ interface ChartSession {
   manager: DrawingManager;
   latest(): void;
   toggleCrosshair(): void;
+  cancelGesture(): void;
 }
 
 export function useMarketChart(
@@ -43,6 +60,12 @@ export function useMarketChart(
 ) {
   const container = useRef<HTMLDivElement>(null);
   const session = useRef<ChartSession | null>(null);
+  // Coarse candles must not overwrite the requested intraday dates on a round trip.
+  const viewport = useRef<{
+    instrumentId: string;
+    datasetId: string;
+    range?: TimeRange;
+  }>({ instrumentId: instrument.id, datasetId: instrument.datasetId });
   const [loading, setLoading] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [error, setError] = useState<string>();
@@ -50,6 +73,7 @@ export function useMarketChart(
   const [selected, setSelected] = useState<Drawing>();
   const [tool, setTool] = useState<DrawingKind | null>(null);
   const [crosshair, setCrosshair] = useState(false);
+  const [measurement, setMeasurement] = useState<RulerMeasurement>();
   const [loadedCount, setLoadedCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -57,15 +81,30 @@ export function useMarketChart(
   // biome-ignore lint/correctness/useExhaustiveDependencies: revision explicitly retries chart initialization after a load error.
   useEffect(() => {
     if (!container.current) return;
+    if (
+      viewport.current.instrumentId !== instrument.id ||
+      viewport.current.datasetId !== instrument.datasetId
+    ) {
+      viewport.current = {
+        instrumentId: instrument.id,
+        datasetId: instrument.datasetId,
+      };
+    }
+    const initialRange = viewport.current.range;
     let disposed = false;
     let bars: Candle[] = [];
+    let chartBars: OHLC[] = [];
     let more = false;
     let newer = false;
     let fetching = false;
     let requestId = 0;
+    let pendingHistory: ReturnType<typeof waitForHistoryIdle> | undefined;
+    const activePointers = new Set<number>();
     let previousRange: { from: number; to: number } | null = null;
     let initialized = false;
-    let pricePrecision = 0;
+    let viewportInteraction = false;
+    let observedRange: TimeRange | undefined;
+    let pricePrecision = instrument.pricePrecision ?? 0;
     let crosshairVisible = false;
     let saveTimer: ReturnType<typeof setTimeout> | undefined;
     const host = container.current;
@@ -76,6 +115,7 @@ export function useMarketChart(
     setSelected(undefined);
     setTool(null);
     setCrosshair(false);
+    setMeasurement(undefined);
     setLoadedCount(0);
     setHasMore(false);
 
@@ -110,6 +150,7 @@ export function useMarketChart(
         secondsVisible: false,
         rightOffset: 5,
         barSpacing: 9,
+        shiftVisibleRangeOnNewBar: false,
       },
       crosshair: {
         mode: CrosshairMode.Hidden,
@@ -133,6 +174,11 @@ export function useMarketChart(
       wickDownColor: '#000000',
       priceLineColor: '#737373',
     });
+    const pane = series.getPane();
+    const daySeparators = !['1D', '1W', '1M'].includes(timeframe)
+      ? new DaySeparators(chart)
+      : undefined;
+    if (daySeparators) pane.attachPrimitive(daySeparators);
     const manager = new DrawingManager(chart, series, {
       magnet: 'off',
       stayInDrawingMode: false,
@@ -161,6 +207,8 @@ export function useMarketChart(
       if (!disposed) setTool(kind);
     });
     manager.on('add', (drawing) => {
+      // Copies already carry their source's complete style.
+      if (!manager.tool()) return;
       manager.update({
         ...drawing,
         style: {
@@ -173,17 +221,18 @@ export function useMarketChart(
     });
 
     const setSeriesData = () => {
-      series.setData(
-        bars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })),
-      );
+      chartBars = bars.map((bar) => ({
+        ...bar,
+        time: bar.time as UTCTimestamp,
+      }));
+      daySeparators?.setCandles(bars);
+      series.setData(chartBars);
       setLoadedCount(bars.length);
     };
     const updatePricePrecision = (candles: Candle[]) => {
       for (const bar of candles) {
         for (const price of [bar.open, bar.high, bar.low, bar.close]) {
-          const decimals =
-            price.toFixed(8).replace(/0+$/, '').split('.')[1]?.length ?? 0;
-          pricePrecision = Math.max(pricePrecision, decimals);
+          pricePrecision = Math.max(pricePrecision, decimalPlaces(price));
         }
       }
       series.applyOptions({
@@ -200,6 +249,11 @@ export function useMarketChart(
       previousRange = {
         from: Math.max(-5, bars.length - VISIBLE_BARS),
         to: bars.length + 5,
+      };
+      viewportInteraction = false;
+      viewport.current.range = {
+        from: bars[Math.max(0, bars.length - VISIBLE_BARS)].time,
+        to: bars[bars.length - 1].time,
       };
       chart.timeScale().setVisibleLogicalRange(previousRange);
     };
@@ -225,8 +279,19 @@ export function useMarketChart(
           direction === 'newer' ? bars.at(-1)?.time : undefined,
         );
         if (disposed || currentRequest !== requestId) return;
+        // Changing cached indices during a drag invalidates the library's drag origin.
+        const idle = waitForHistoryIdle(
+          () => chart.timeScale().getVisibleLogicalRange(),
+          () => activePointers.size > 0,
+        );
+        pendingHistory = idle;
+        const ready = await idle.ready;
+        if (pendingHistory === idle) pendingHistory = undefined;
+        if (!ready || disposed || currentRequest !== requestId) return;
         const range = chart.timeScale().getVisibleLogicalRange();
-        const window = mergeHistoryWindow(bars, page.candles, direction);
+        const window = mergeHistoryWindow(bars, page.candles, direction, range);
+        if (!window.preservesViewport) return;
+        viewportInteraction = false;
         bars = window.candles;
         if (direction === 'older') {
           more = page.hasMore;
@@ -260,11 +325,13 @@ export function useMarketChart(
     };
     const latest = async () => {
       if (disposed || !initialized) return;
+      gestures.cancel();
       if (!newer && !fetching) {
         showLatest();
         return;
       }
       // A jump to the end supersedes a page request still in flight.
+      pendingHistory?.cancel();
       const currentRequest = ++requestId;
       fetching = true;
       setLoadingOlder(true);
@@ -295,24 +362,36 @@ export function useMarketChart(
         }
       }
     };
+    const rememberViewport = () => {
+      const range = chart.timeScale().getVisibleRange();
+      if (
+        range &&
+        typeof range.from === 'number' &&
+        typeof range.to === 'number'
+      ) {
+        // Price-scale and drawing drags leave dates unchanged.
+        if (
+          initialized &&
+          viewportInteraction &&
+          observedRange &&
+          (range.from !== observedRange.from || range.to !== observedRange.to)
+        ) {
+          viewport.current.range = { from: range.from, to: range.to };
+        }
+        observedRange = { from: range.from, to: range.to };
+      }
+    };
     const onRange = (range: LogicalRange | null) => {
-      if (!range || fetching) return;
+      if (!range || disposed) return;
+      rememberViewport();
       const previous = previousRange;
       previousRange = range;
-      const nearStart = range.from < HISTORY_THRESHOLD && more;
-      const nearEnd = range.to > bars.length - HISTORY_THRESHOLD && newer;
-      if (nearStart && nearEnd) {
-        // A wide viewport can reach both ends. Follow the actual pan direction.
-        if (previous && range.from < previous.from && range.to < previous.to)
-          void loadPage('older');
-        else if (
-          previous &&
-          range.from > previous.from &&
-          range.to > previous.to
-        )
-          void loadPage('newer');
-      } else if (nearStart) void loadPage('older');
-      else if (nearEnd) void loadPage('newer');
+      if (fetching || !initialized || !viewportInteraction) return;
+      const direction = historyLoadDirection(range, previous, bars.length, {
+        older: more,
+        newer,
+      });
+      if (direction) void loadPage(direction);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
     chart.subscribeCrosshairMove((event) => {
@@ -328,6 +407,7 @@ export function useMarketChart(
     });
 
     const toggleCrosshair = () => {
+      gestures.cancel();
       crosshairVisible = !crosshairVisible;
       chart.applyOptions({
         crosshair: {
@@ -354,21 +434,57 @@ export function useMarketChart(
     const preventAutoscroll = (event: MouseEvent) => {
       if (event.button === 1) event.preventDefault();
     };
+    const navigateViewport = () => {
+      viewportInteraction = true;
+    };
+    const dragViewport = (event: PointerEvent) => {
+      if (event.buttons & 1) navigateViewport();
+    };
+    const startGesture = (event: PointerEvent) => {
+      if (event.button === 0) activePointers.add(event.pointerId);
+    };
+    const endGesture = (event: PointerEvent) => {
+      activePointers.delete(event.pointerId);
+    };
+    const resetGestures = () => activePointers.clear();
     host.addEventListener('pointerdown', middleDown, true);
+    host.addEventListener('pointerdown', startGesture, true);
+    window.addEventListener('pointerup', endGesture, true);
+    window.addEventListener('pointercancel', endGesture, true);
+    window.addEventListener('blur', resetGestures);
     host.addEventListener('mousedown', preventAutoscroll, true);
     host.addEventListener('auxclick', preventAutoscroll);
+    host.addEventListener('wheel', navigateViewport, {
+      capture: true,
+      passive: true,
+    });
+    host.addEventListener('pointermove', dragViewport, true);
+    host.addEventListener('dblclick', navigateViewport, true);
+    const gestures = bindChartGestures({
+      host,
+      chart,
+      series,
+      manager,
+      coords: makeCoords(chart, series, () => chartBars),
+      ready: () => initialized && !disposed,
+      crosshair: () => crosshairVisible,
+      measure: (next) => {
+        if (!disposed) setMeasurement(next);
+      },
+    });
     session.current = {
       manager,
       latest,
       toggleCrosshair,
+      cancelGesture: gestures.cancel,
     };
 
     void Promise.all([
-      repository.loadCandles(
+      loadViewportHistory(
+        repository,
         instrument.datasetId,
         timeframe,
-        undefined,
-        PAGE_SIZE,
+        initialRange,
       ),
       repository.loadDrawings(instrument.id),
     ])
@@ -380,7 +496,25 @@ export function useMarketChart(
         setHasMore(more);
         updatePricePrecision(bars);
         setSeriesData();
-        showLatest();
+        const scale = chart.timeScale();
+        const range =
+          initialRange &&
+          viewportLogicalRange(
+            bars,
+            timeframe,
+            initialRange,
+            Math.min(
+              MAX_CACHED_CANDLES,
+              (scale.width() || host.clientWidth) /
+                scale.options().minBarSpacing,
+            ),
+          );
+        if (range) {
+          previousRange = range;
+          scale.setVisibleLogicalRange(range);
+        } else {
+          showLatest();
+        }
         if (drawings) manager.importJSON(drawings);
         initialized = true;
         setCandle(bars.at(-1));
@@ -392,17 +526,35 @@ export function useMarketChart(
       });
 
     return () => {
+      if (initialized && viewportInteraction) rememberViewport();
       disposed = true;
+      pendingHistory?.cancel();
+      gestures.destroy();
       clearTimeout(saveTimer);
       saveDrawings();
       session.current = null;
       host.removeEventListener('pointerdown', middleDown, true);
+      host.removeEventListener('pointerdown', startGesture, true);
+      window.removeEventListener('pointerup', endGesture, true);
+      window.removeEventListener('pointercancel', endGesture, true);
+      window.removeEventListener('blur', resetGestures);
       host.removeEventListener('mousedown', preventAutoscroll, true);
       host.removeEventListener('auxclick', preventAutoscroll);
+      host.removeEventListener('wheel', navigateViewport, true);
+      host.removeEventListener('pointermove', dragViewport, true);
+      host.removeEventListener('dblclick', navigateViewport, true);
       manager.destroy();
+      if (daySeparators) pane.detachPrimitive(daySeparators);
       chart.remove();
     };
-  }, [instrument.id, instrument.datasetId, timeframe, repository, revision]);
+  }, [
+    instrument.id,
+    instrument.datasetId,
+    instrument.pricePrecision,
+    timeframe,
+    repository,
+    revision,
+  ]);
 
   return {
     container,
@@ -413,10 +565,13 @@ export function useMarketChart(
     selected,
     tool,
     crosshair,
+    measurement,
     loadedCount,
     hasMore,
-    selectTool: (kind: DrawingKind | null) =>
-      session.current?.manager.setTool(kind),
+    selectTool: (kind: DrawingKind | null) => {
+      session.current?.cancelGesture();
+      session.current?.manager.setTool(kind);
+    },
     recolor: (color: string) => {
       const manager = session.current?.manager;
       const id = manager?.selection()[0];

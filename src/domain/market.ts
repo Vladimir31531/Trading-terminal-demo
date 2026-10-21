@@ -29,6 +29,8 @@ export interface Instrument {
   firstTime: number;
   lastTime: number;
   createdAt: number;
+  /** Decimal resolution of all source OHLC prices, up to eight digits. */
+  pricePrecision?: number;
 }
 
 export interface ImportProgress {

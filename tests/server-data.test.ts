@@ -158,6 +158,70 @@ describe('local market data', () => {
     ).rejects.toThrow('граница');
   });
 
+  test('retains source price precision even when aggregation removes fractional prices', async () => {
+    const { store, filePath, dataDir } = await fixture(
+      `${HEADER}\n2026-01-01 00:00:00Z,10,12,9,11,0\n2026-01-01 00:00:01Z,11.001,11.5,10,11.3,0\n2026-01-01 00:00:02Z,11,12,9,11,0`,
+    );
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    expect(instrument.pricePrecision).toBe(3);
+    for (const timeframe of TIMEFRAMES) {
+      expect(
+        (await store.loadCandles(instrument.datasetId, timeframe)).candles[0],
+      ).toMatchObject({
+        open: 10,
+        high: 12,
+        low: 9,
+        close: 11,
+      });
+    }
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new LocalMarketStore({ dataDir });
+    stores.push(restarted);
+    expect(restarted.listInstruments()).toEqual([instrument]);
+  });
+
+  test('migrates legacy precision from the minute cache once without reading the source CSV', async () => {
+    const { store, filePath, dataDir } = await fixture(
+      `${HEADER}\n2026-01-01 00:00:00Z,10,12.001,9,11,0`,
+    );
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    store.saveDrawings(instrument.id, '[{"id":"saved"}]');
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const legacy = new Database(join(dataDir, 'market.sqlite'));
+    legacy.run('ALTER TABLE instruments DROP COLUMN pricePrecision');
+    legacy.close();
+    await rm(filePath);
+
+    const migrated = new LocalMarketStore({ dataDir });
+    stores.push(migrated);
+    expect(migrated.listInstruments()).toEqual([instrument]);
+    expect(migrated.loadDrawings(instrument.id)).toBe('[{"id":"saved"}]');
+    const db = new Database(join(dataDir, 'market.sqlite'));
+    expect(
+      db
+        .query<{ pricePrecision: number }, []>(
+          'SELECT pricePrecision FROM instruments',
+        )
+        .get()?.pricePrecision,
+    ).toBe(3);
+    db.run('UPDATE candles SET high = 12');
+    expect(migrated.listInstruments()[0].pricePrecision).toBe(3);
+    db.close();
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+    const restarted = new LocalMarketStore({ dataDir });
+    stores.push(restarted);
+    expect(restarted.listInstruments()).toEqual([instrument]);
+  });
+
   test('persists instruments and drawings across service restart', async () => {
     const { store, dataDir, filePath } = await fixture();
     const instrument = await store.importInstrument(
@@ -177,6 +241,98 @@ describe('local market data', () => {
     ).toHaveLength(1);
   });
 
+  test('deletes only the selected instrument and its cache, preserving its CSV across restart', async () => {
+    const { store, dataDir, filePath, csv } = await fixture();
+    const removed = await store.importInstrument(
+      { filePath, ticker: 'REMOVE' },
+      noProgress,
+    );
+    const retained = await store.importInstrument(
+      { filePath, ticker: 'KEEP' },
+      noProgress,
+    );
+    store.saveDrawings(removed.id, '[{"id":"removed"}]');
+    store.saveDrawings(retained.id, '[{"id":"retained"}]');
+
+    store.deleteInstrument(removed.id);
+
+    expect(store.listInstruments()).toEqual([retained]);
+    expect(() => store.deleteInstrument(removed.id)).toThrow(
+      expect.objectContaining({ status: 404 }),
+    );
+    expect(() => store.loadDrawings(removed.id)).toThrow(
+      expect.objectContaining({ status: 404 }),
+    );
+    await expect(
+      store.loadCandles(removed.datasetId, '1m'),
+    ).rejects.toMatchObject({
+      status: 404,
+    });
+    const db = new Database(join(dataDir, 'market.sqlite'), { readonly: true });
+    for (const table of ['datasets', 'candles']) {
+      const column = table === 'datasets' ? 'id' : 'datasetId';
+      expect(
+        db
+          .query<{ count: number }, [string]>(
+            `SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`,
+          )
+          .get(removed.datasetId)?.count,
+      ).toBe(0);
+    }
+    expect(
+      db
+        .query<{ count: number }, [string]>(
+          'SELECT COUNT(*) AS count FROM drawings WHERE instrumentId = ?',
+        )
+        .get(removed.id)?.count,
+    ).toBe(0);
+    db.close();
+    expect(await readFile(filePath, 'utf8')).toBe(csv);
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new LocalMarketStore({ dataDir });
+    stores.push(restarted);
+    expect(restarted.listInstruments()).toEqual([retained]);
+    expect(restarted.loadDrawings(retained.id)).toBe('[{"id":"retained"}]');
+    expect(
+      (await restarted.loadCandles(retained.datasetId, '1m')).candles,
+    ).toHaveLength(1);
+  });
+
+  test('a replacement import cannot restore an instrument deleted by another connection', async () => {
+    const { store, dataDir, filePath } = await fixture();
+    const original = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const otherConnection = new LocalMarketStore({
+      dataDir,
+      recoverIncomplete: false,
+    });
+    stores.push(otherConnection);
+    await expect(
+      store.importInstrument(
+        { filePath, ticker: 'REPLACEMENT', instrumentId: original.id },
+        (progress) => {
+          if (progress.phase === 'saving')
+            otherConnection.deleteInstrument(original.id);
+        },
+      ),
+    ).rejects.toMatchObject({ status: 404 });
+    expect(store.listInstruments()).toEqual([]);
+    const db = new Database(join(dataDir, 'market.sqlite'), { readonly: true });
+    for (const table of ['datasets', 'candles']) {
+      expect(
+        db
+          .query<{ count: number }, []>(
+            `SELECT COUNT(*) AS count FROM ${table}`,
+          )
+          .get()?.count,
+      ).toBe(0);
+    }
+    db.close();
+  });
+
   test('replaces a dataset atomically and preserves drawings and instrument identity', async () => {
     const { store, filePath, directory, dataDir } = await fixture();
     const original = await store.importInstrument(
@@ -187,7 +343,7 @@ describe('local market data', () => {
     const replacementPath = join(directory, 'new.csv');
     await writeFile(
       replacementPath,
-      `${HEADER}\n2026-02-01 00:00:00.000+00:00,20,22,19,21,0`,
+      `${HEADER}\n2026-02-01 00:00:00.000+00:00,20,22.01,19,21,0`,
     );
     const replacement = await store.importInstrument(
       { filePath: replacementPath, ticker: 'NEW', instrumentId: original.id },
@@ -196,6 +352,8 @@ describe('local market data', () => {
     expect(replacement.id).toBe(original.id);
     expect(replacement.createdAt).toBe(original.createdAt);
     expect(replacement.datasetId).not.toBe(original.datasetId);
+    expect(original.pricePrecision).toBe(0);
+    expect(replacement.pricePrecision).toBe(2);
     expect(store.listInstruments()).toEqual([replacement]);
     expect(store.loadDrawings(original.id)).toBe('{}');
     await expect(store.loadCandles(original.datasetId, '1m')).rejects.toThrow(

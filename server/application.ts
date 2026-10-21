@@ -173,6 +173,13 @@ export function createApplication(
           );
         }
         const instrument = /^\/api\/instruments\/([^/]+)$/.exec(path);
+        if (request.method === 'DELETE' && instrument) {
+          store.deleteInstrument(instrument[1]);
+          return new Response(null, {
+            status: 204,
+            headers: { 'Cache-Control': 'no-store' },
+          });
+        }
         if (request.method === 'PATCH' && instrument) {
           store.renameInstrument(
             instrument[1],

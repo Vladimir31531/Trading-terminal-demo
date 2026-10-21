@@ -240,6 +240,58 @@ test('imports a disk source in a worker and serves metadata, pages and drawings'
   );
 });
 
+test('deletes an instrument only with authentication and persists removal without changing its source', async () => {
+  const listing = (await (await call('/api/files')).json()) as DirectoryListing;
+  const imported = await call('/api/imports', {
+    method: 'POST',
+    body: JSON.stringify({ sourceId: listing.entries[0].id, ticker: 'DELETE' }),
+  });
+  const events = (await imported.text())
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as ImportEvent);
+  const completed = events.find((event) => event.type === 'complete');
+  if (completed?.type !== 'complete') throw new Error(JSON.stringify(events));
+  const instrument = completed.instrument;
+  await call(`/api/drawings/${instrument.id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ json: '[]' }),
+  });
+  expect(
+    (
+      await call(`/api/instruments/${instrument.id}`, {
+        method: 'DELETE',
+        headers: { 'X-Terminal-Token': '' },
+      })
+    ).status,
+  ).toBe(401);
+  expect(await (await call('/api/instruments')).json()).toEqual([instrument]);
+
+  const deleted = await call(`/api/instruments/${instrument.id}`, {
+    method: 'DELETE',
+  });
+  expect(deleted.status).toBe(204);
+  expect(await deleted.text()).toBe('');
+  expect(await (await call('/api/instruments')).json()).toEqual([]);
+  expect((await call(`/api/drawings/${instrument.id}`)).status).toBe(404);
+  expect(
+    (await call(`/api/candles?datasetId=${instrument.datasetId}&timeframe=1m`))
+      .status,
+  ).toBe(404);
+  expect(
+    (await call(`/api/instruments/${instrument.id}`, { method: 'DELETE' }))
+      .status,
+  ).toBe(404);
+  await application.close();
+  application = createApplication(config, identity);
+  token = ((await (await call('/api/session')).json()) as { token: string })
+    .token;
+  expect(await (await call('/api/instruments')).json()).toEqual([]);
+  expect(await readFile(join(directory, 'sources/prices.csv'), 'utf8')).toBe(
+    CSV,
+  );
+});
+
 test('recognizes only a matching project instance on an occupied port', async () => {
   let served: unknown = identity;
   const server = Bun.serve({
