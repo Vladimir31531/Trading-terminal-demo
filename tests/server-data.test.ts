@@ -34,6 +34,324 @@ async function fixture(
 function noProgress(): void {}
 
 describe('local market data', () => {
+  test('seeks and pages raw seconds using sparse source offsets without caching raw candles', async () => {
+    const start = Date.parse('2026-01-01T00:00:00Z') / 1000;
+    const rows = Array.from({ length: 12500 }, (_, second) => {
+      const time = new Date((start + second) * 1000).toISOString();
+      return `"${time}",10,12,9,11,"объём 🚀,строка\r\nещё ""значение"""`;
+    });
+    const csv = `\uFEFF${HEADER}\r\n${rows.join('\r\n')}`;
+    const { store, filePath, dataDir } = await fixture(csv);
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const first = await store.loadSeconds(
+      instrument.datasetId,
+      start + 8190,
+      start + 8210,
+      undefined,
+      15,
+    );
+    expect(first.candles.map((candle) => candle.time)).toEqual(
+      Array.from({ length: 15 }, (_, index) => start + 8190 + index),
+    );
+    expect(first.hasMore).toBe(true);
+    const second = await store.loadSeconds(
+      instrument.datasetId,
+      start + 8190,
+      start + 8210,
+      first.candles.at(-1)?.time,
+      15,
+    );
+    expect(second.candles.map((candle) => candle.time)).toEqual(
+      Array.from({ length: 6 }, (_, index) => start + 8205 + index),
+    );
+    expect(second.hasMore).toBe(false);
+    expect(second.hasNewer).toBe(false);
+    const db = new Database(join(dataDir, 'market.sqlite'), { readonly: true });
+    const offsets = db
+      .query<{ byteOffset: number; rowNumber: number }, [string]>(
+        'SELECT byteOffset, rowNumber FROM source_offsets WHERE datasetId = ? ORDER BY time',
+      )
+      .all(instrument.datasetId);
+    expect(offsets).toHaveLength(4);
+    expect(offsets.map((offset) => offset.rowNumber)).toEqual([
+      2, 4098, 8194, 12290,
+    ]);
+    const bytes = Buffer.from(csv, 'utf8');
+    for (const offset of offsets)
+      expect(bytes.subarray(offset.byteOffset).toString('utf8')).toStartWith(
+        `"${new Date((start + offset.rowNumber - 2) * 1000).toISOString()}",`,
+      );
+    expect(
+      db
+        .query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM candles WHERE timeframe = '1s'",
+        )
+        .get()?.count,
+    ).toBe(0);
+    db.close();
+    expect(await readFile(filePath, 'utf8')).toBe(csv);
+  });
+
+  test('lazily builds one persistent index for a legacy dataset and cascades its removal', async () => {
+    const csv = `${HEADER}\n2026-01-01 00:00:00Z,10,12,9,11,0\n2026-01-01 00:00:03Z,11,13,9,12,0`;
+    const { store, filePath, dataDir } = await fixture(csv);
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const db = new Database(join(dataDir, 'market.sqlite'));
+    db.run('DELETE FROM source_indexes; DELETE FROM source_offsets;');
+    const [one, two] = await Promise.all([
+      store.loadSeconds(
+        instrument.datasetId,
+        instrument.firstTime,
+        instrument.lastTime,
+      ),
+      store.loadSeconds(
+        instrument.datasetId,
+        instrument.firstTime + 1,
+        instrument.lastTime,
+      ),
+    ]);
+    expect(one.candles).toHaveLength(2);
+    expect(two.candles).toHaveLength(1);
+    expect(two.candles[0].time).toBe(instrument.lastTime);
+    expect(
+      db
+        .query<{ count: number }, []>(
+          'SELECT COUNT(*) AS count FROM source_indexes',
+        )
+        .get()?.count,
+    ).toBe(1);
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new LocalMarketStore({ dataDir });
+    stores.push(restarted);
+    expect(
+      (
+        await restarted.loadSeconds(
+          instrument.datasetId,
+          instrument.firstTime,
+          instrument.lastTime,
+        )
+      ).candles,
+    ).toEqual(one.candles);
+    restarted.deleteInstrument(instrument.id);
+    for (const table of ['source_indexes', 'source_offsets'])
+      expect(
+        db
+          .query<{ count: number }, []>(
+            `SELECT COUNT(*) AS count FROM ${table}`,
+          )
+          .get()?.count,
+      ).toBe(0);
+    db.close();
+    expect(await readFile(filePath, 'utf8')).toBe(csv);
+  });
+
+  test('constructs inclusive partial candles without exposing later source extremes on every timeframe', async () => {
+    const csv = `${HEADER}\n2026-01-05 09:00:00Z,10,14,8,12,0\n2026-01-05 09:00:59Z,12,15,9,13,0\n2026-01-05 09:01:00Z,13,16,11,14,0\n2026-01-05 09:01:30Z,14,17,12,15,0\n2026-01-05 09:01:31Z,15,999,1,900,0\n2026-01-06 00:00:00Z,900,1000,2,950,0`;
+    const { store, filePath } = await fixture(csv);
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const asOf = Date.parse('2026-01-05T09:01:30Z') / 1000;
+    for (const timeframe of TIMEFRAMES) {
+      const snapshot = await store.loadCandles(
+        instrument.datasetId,
+        timeframe,
+        undefined,
+        800,
+        undefined,
+        asOf,
+      );
+      const current = snapshot.candles.at(-1);
+      expect(current?.close).toBe(15);
+      expect(current?.high).toBe(17);
+      expect(current?.low).toBe(timeframe === '1m' ? 11 : 8);
+      expect(current?.open).toBe(timeframe === '1m' ? 13 : 10);
+      expect(snapshot.hasNewer).toBe(false);
+      expect(snapshot.candles.every((candle) => candle.time <= asOf)).toBe(
+        true,
+      );
+      expect(snapshot.candles.every((candle) => candle.high < 999)).toBe(true);
+    }
+    const afterCurrent = await store.loadCandles(
+      instrument.datasetId,
+      '1m',
+      undefined,
+      800,
+      Date.parse('2026-01-05T09:01:00Z') / 1000,
+      asOf,
+    );
+    expect(afterCurrent.candles).toEqual([]);
+    expect(afterCurrent.hasMore).toBe(true);
+    expect(afterCurrent.hasNewer).toBe(false);
+    const empty = await store.loadCandles(
+      instrument.datasetId,
+      '1M',
+      undefined,
+      800,
+      undefined,
+      instrument.firstTime - 1,
+    );
+    expect(empty).toEqual({ candles: [], hasMore: false, hasNewer: false });
+  });
+
+  test('cancels legacy preparation without cancelling another reader and permits a retry', async () => {
+    const start = Date.parse('2026-01-01T00:00:00Z') / 1000;
+    const rows = Array.from(
+      { length: 30000 },
+      (_, index) =>
+        `${new Date((start + index) * 1000).toISOString()},10,12,9,11,0`,
+    );
+    const { store, filePath, dataDir } = await fixture(
+      `${HEADER}\n${rows.join('\n')}`,
+    );
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const db = new Database(join(dataDir, 'market.sqlite'));
+    db.run('DELETE FROM source_indexes; DELETE FROM source_offsets;');
+    const controller = new AbortController();
+    const cancelled = store.loadSeconds(
+      instrument.datasetId,
+      start + 25000,
+      start + 25002,
+      undefined,
+      10,
+      controller.signal,
+    );
+    const retained = store.loadSeconds(
+      instrument.datasetId,
+      start + 26000,
+      start + 26002,
+    );
+    setTimeout(() => controller.abort(), 0);
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+    expect((await retained).candles.map((candle) => candle.time)).toEqual([
+      start + 26000,
+      start + 26001,
+      start + 26002,
+    ]);
+    expect(
+      (
+        await store.loadSeconds(
+          instrument.datasetId,
+          start + 25000,
+          start + 25002,
+        )
+      ).candles,
+    ).toHaveLength(3);
+    expect(
+      db
+        .query<{ count: number }, []>(
+          'SELECT COUNT(*) AS count FROM source_indexes',
+        )
+        .get()?.count,
+    ).toBe(1);
+    db.close();
+  });
+
+  test('paginates snapshot history in both directions with the partial candle included once', async () => {
+    const start = Date.parse('2026-01-01T00:00:00Z') / 1000;
+    const rows = Array.from(
+      { length: 6 },
+      (_, index) =>
+        `${new Date((start + index * 60) * 1000).toISOString()},10,12,9,11,0`,
+    );
+    const { store, filePath } = await fixture(`${HEADER}\n${rows.join('\n')}`);
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    const asOf = start + 4 * 60;
+    const latest = await store.loadCandles(
+      instrument.datasetId,
+      '1m',
+      undefined,
+      2,
+      undefined,
+      asOf,
+    );
+    expect(latest.candles.map((candle) => candle.time)).toEqual([
+      start + 180,
+      start + 240,
+    ]);
+    expect(latest.hasMore).toBe(true);
+    expect(latest.hasNewer).toBe(false);
+    const older = await store.loadCandles(
+      instrument.datasetId,
+      '1m',
+      start + 180,
+      2,
+      undefined,
+      asOf,
+    );
+    expect(older.candles.map((candle) => candle.time)).toEqual([
+      start + 60,
+      start + 120,
+    ]);
+    expect(older.hasMore).toBe(true);
+    expect(older.hasNewer).toBe(true);
+    const forward = await store.loadCandles(
+      instrument.datasetId,
+      '1m',
+      undefined,
+      2,
+      start + 120,
+      asOf,
+    );
+    expect(forward).toEqual(latest);
+  });
+
+  test('validates raw ranges, returns empty gaps and rejects stale or aborted sources', async () => {
+    const { store, filePath } = await fixture();
+    const instrument = await store.importInstrument(
+      { filePath, ticker: 'TEST' },
+      noProgress,
+    );
+    for (const [from, through, after, limit] of [
+      [2, 1, undefined, 10],
+      [Number.NaN, 1, undefined, 10],
+      [0, 1, Number.NaN, 10],
+      [0, 1, undefined, 0],
+    ] as const)
+      await expect(
+        store.loadSeconds(instrument.datasetId, from, through, after, limit),
+      ).rejects.toMatchObject({ status: 400 });
+    expect(await store.loadSeconds(instrument.datasetId, 0, 1)).toEqual({
+      candles: [],
+      hasMore: false,
+      hasNewer: false,
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      store.loadSeconds(
+        instrument.datasetId,
+        instrument.firstTime,
+        instrument.lastTime,
+        undefined,
+        10,
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    await writeFile(filePath, `${HEADER}\n`);
+    await expect(
+      store.loadSeconds(
+        instrument.datasetId,
+        instrument.firstTime,
+        instrument.lastTime,
+      ),
+    ).rejects.toThrow('изменён');
+  });
+
   test('streams source CSV, caches all nine timeframes and keeps source unchanged', async () => {
     const csv = `${HEADER}\r\n2026-01-31 23:59:00.000+00:00,10,12,9,11,unused\r\n2026-01-31 23:59:01.000+00:00,11,13,10,12,unused\r\n2026-02-01 00:00:00.000+00:00,12,15,11,14,unused\r\n`;
     const { filePath, store, directory, dataDir } = await fixture(csv);

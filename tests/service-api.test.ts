@@ -180,6 +180,14 @@ describe('local service boundaries', () => {
       (await call('/api/candles?datasetId=x&timeframe=1m&before=1&after=2'))
         .status,
     ).toBe(400);
+    for (const path of [
+      '/api/candles?datasetId=x&timeframe=1m&asOf=bad',
+      '/api/seconds?datasetId=x',
+      '/api/seconds?datasetId=x&from=0&through=bad',
+      '/api/seconds?datasetId=x&from=2&through=1',
+      '/api/seconds?datasetId=x&from=0&through=1&limit=5001',
+    ])
+      expect((await call(path)).status).toBe(400);
     expect(
       (await call('/api/imports', { method: 'POST', body: '[' })).status,
     ).toBe(400);
@@ -222,6 +230,22 @@ test('imports a disk source in a worker and serves metadata, pages and drawings'
   expect(page.candles[0].close).toBe(11);
   expect(page.hasMore).toBe(true);
   expect(page.hasNewer).toBe(false);
+  const seconds = (await (
+    await call(
+      `/api/seconds?datasetId=${instrument.datasetId}&from=${instrument.firstTime}&through=${instrument.lastTime}&limit=2`,
+    )
+  ).json()) as HistoryPage;
+  expect(seconds.candles.map((candle) => candle.close)).toEqual([11, 12]);
+  expect(seconds.hasMore).toBe(true);
+  const snapshot = (await (
+    await call(
+      `/api/candles?datasetId=${instrument.datasetId}&timeframe=1H&asOf=${instrument.firstTime}`,
+    )
+  ).json()) as HistoryPage;
+  expect(snapshot.candles).toEqual([
+    { time: instrument.firstTime, open: 10, high: 12, low: 9, close: 11 },
+  ]);
+  expect(snapshot.hasNewer).toBe(false);
   await call(`/api/instruments/${instrument.id}`, {
     method: 'PATCH',
     body: JSON.stringify({ ticker: 'GOLD' }),

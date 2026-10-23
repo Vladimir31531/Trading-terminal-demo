@@ -26,6 +26,16 @@ export interface MarketRepository {
     before?: number,
     limit?: number,
     after?: number,
+    asOf?: number,
+    signal?: AbortSignal,
+  ): Promise<HistoryPage>;
+  loadSeconds(
+    datasetId: string,
+    from: number,
+    through: number,
+    after?: number,
+    limit?: number,
+    signal?: AbortSignal,
   ): Promise<HistoryPage>;
   loadDrawings(instrumentId: string): Promise<string | undefined>;
   saveDrawings(instrumentId: string, json: string): Promise<void>;

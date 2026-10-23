@@ -9,6 +9,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { MarketRepository } from '../application/market-repository';
+import type { SimulationEngine } from '../application/simulation-engine';
 import { useMarketChart } from '../chart/use-market-chart';
 import type { Instrument, Timeframe } from '../domain/market';
 import { ChartRuler } from './ChartRuler';
@@ -22,10 +23,16 @@ interface Props {
   instrument: Instrument;
   timeframe: Timeframe;
   repository: MarketRepository;
+  simulation?: SimulationEngine;
 }
 
-export function MarketChart({ instrument, timeframe, repository }: Props) {
-  const state = useMarketChart(instrument, timeframe, repository);
+export function MarketChart({
+  instrument,
+  timeframe,
+  repository,
+  simulation,
+}: Props) {
+  const state = useMarketChart(instrument, timeframe, repository, simulation);
   return (
     <section
       className="market-chart"

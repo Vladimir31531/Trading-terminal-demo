@@ -5,16 +5,21 @@ import {
   HardDrive,
   LoaderCircle,
   Pencil,
+  Play,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
+import { SimulationEngine } from './application/simulation-engine';
 import { DeleteInstrumentDialog } from './components/DeleteInstrumentDialog';
 import { InstrumentDialog } from './components/InstrumentDialog';
 import { MarketChart } from './components/MarketChart';
+import { SimulationControls } from './components/SimulationControls';
+import { SimulationDialog } from './components/SimulationDialog';
 import { Button } from './components/ui/button';
 import { type Instrument, TIMEFRAMES, type Timeframe } from './domain/market';
+import type { SimulationSettings } from './domain/simulation';
 import { marketRepository } from './infrastructure/market-repository';
 
 const numberFormat = new Intl.NumberFormat('ru-RU');
@@ -38,7 +43,36 @@ export default function App() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingInstrument, setEditingInstrument] = useState<Instrument>();
   const [deletingInstrument, setDeletingInstrument] = useState<Instrument>();
+  const [simulationDialogOpen, setSimulationDialogOpen] = useState(false);
+  const [simulation, setSimulation] = useState<SimulationEngine>();
   const selected = instruments.find((item) => item.id === selectedId);
+  const activeSimulation =
+    simulation?.datasetId === selected?.datasetId ? simulation : undefined;
+
+  useEffect(() => () => simulation?.destroy(), [simulation]);
+  useEffect(() => {
+    if (simulation && simulation.datasetId !== selected?.datasetId) {
+      simulation.destroy();
+      setSimulation(undefined);
+    }
+  }, [simulation, selected?.datasetId]);
+
+  function startSimulation(settings: SimulationSettings) {
+    if (!selected) return;
+    simulation?.destroy();
+    const next = new SimulationEngine(
+      selected.datasetId,
+      settings,
+      marketRepository,
+    );
+    setSimulation(next);
+    next.start();
+  }
+
+  function stopSimulation() {
+    simulation?.destroy();
+    setSimulation(undefined);
+  }
 
   const refresh = useCallback(async (preferredId?: string) => {
     const items = await marketRepository.listInstruments();
@@ -212,6 +246,23 @@ export default function App() {
                 {selected?.ticker ?? 'Графики'}
                 {selected && <span className="chart-type-label">OHLC</span>}
               </h1>
+              {selected &&
+                (activeSimulation ? (
+                  <SimulationControls
+                    engine={activeSimulation}
+                    onStop={stopSimulation}
+                  />
+                ) : (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="simulation-start"
+                    onClick={() => setSimulationDialogOpen(true)}
+                  >
+                    <Play className="size-3.5" /> Начать симуляцию
+                  </Button>
+                ))}
             </div>
             {selected ? (
               <fieldset className="timeframe-group" aria-label="Таймфрейм">
@@ -257,6 +308,7 @@ export default function App() {
                 instrument={selected}
                 timeframe={timeframe}
                 repository={marketRepository}
+                simulation={activeSimulation}
               />
             ) : (
               <div className="empty-workspace">
@@ -296,7 +348,13 @@ export default function App() {
           <footer className="chart-footer">
             <div className="footer-left">
               <span className="footer-status-dot" />
-              <span>{selected ? 'История загружена' : ''}</span>
+              <span>
+                {selected
+                  ? activeSimulation
+                    ? 'Симуляция'
+                    : 'История загружена'
+                  : ''}
+              </span>
               {selected && (
                 <span className="footer-file" title={selected.fileName}>
                   {selected.fileName}
@@ -327,6 +385,15 @@ export default function App() {
         repository={marketRepository}
         onSaved={refresh}
       />
+      {selected && (
+        <SimulationDialog
+          key={selected.datasetId}
+          open={simulationDialogOpen && !activeSimulation}
+          instrument={selected}
+          onOpenChange={setSimulationDialogOpen}
+          onStart={startSimulation}
+        />
+      )}
       {deletingInstrument && (
         <DeleteInstrumentDialog
           key={deletingInstrument.id}

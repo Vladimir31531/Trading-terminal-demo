@@ -11,19 +11,45 @@ export interface TimeRange {
   to: number;
 }
 
+/** Fill the requested live window using pages within the service's size limit. */
+export async function loadLatestHistory(
+  repository: Pick<MarketRepository, 'loadCandles'>,
+  datasetId: string,
+  timeframe: Timeframe,
+  count = INITIAL_PAGE_SIZE,
+): Promise<HistoryPage> {
+  const latest = await repository.loadCandles(
+    datasetId,
+    timeframe,
+    undefined,
+    Math.min(count, SIDE_PAGE_SIZE),
+  );
+  if (
+    !latest.hasMore ||
+    !latest.candles.length ||
+    latest.candles.length >= count
+  )
+    return latest;
+  const older = await repository.loadCandles(
+    datasetId,
+    timeframe,
+    latest.candles[0].time,
+    count - latest.candles.length,
+  );
+  return {
+    ...latest,
+    candles: [...older.candles, ...latest.candles],
+    hasMore: older.hasMore,
+  };
+}
+
 export async function loadViewportHistory(
   repository: Pick<MarketRepository, 'loadCandles'>,
   datasetId: string,
   timeframe: Timeframe,
   range?: TimeRange,
 ): Promise<HistoryPage> {
-  if (!range)
-    return repository.loadCandles(
-      datasetId,
-      timeframe,
-      undefined,
-      INITIAL_PAGE_SIZE,
-    );
+  if (!range) return loadLatestHistory(repository, datasetId, timeframe);
 
   const anchor = candleStart((range.from + range.to) / 2, timeframe);
   const [older, newer] = await Promise.all([

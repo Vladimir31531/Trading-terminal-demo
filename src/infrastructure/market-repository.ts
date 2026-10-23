@@ -216,7 +216,15 @@ export const marketRepository: MarketRepository = {
     });
   },
 
-  loadCandles(datasetId, timeframe, before, limit = DEFAULT_PAGE_SIZE, after) {
+  async loadCandles(
+    datasetId,
+    timeframe,
+    before,
+    limit = DEFAULT_PAGE_SIZE,
+    after,
+    asOf,
+    signal,
+  ) {
     if (!Number.isInteger(limit) || limit < 1)
       return Promise.reject(
         new Error('Размер страницы должен быть положительным.'),
@@ -228,7 +236,23 @@ export const marketRepository: MarketRepository = {
     });
     if (before !== undefined) query.set('before', String(before));
     if (after !== undefined) query.set('after', String(after));
-    return getJson<HistoryPage>(`/api/candles?${query}`);
+    if (asOf !== undefined) query.set('asOf', String(asOf));
+    return (
+      await request(`/api/candles?${query}`, { signal }, asOf === undefined)
+    ).json() as Promise<HistoryPage>;
+  },
+
+  async loadSeconds(datasetId, from, through, after, limit = 2000, signal) {
+    const query = new URLSearchParams({
+      datasetId,
+      from: String(from),
+      through: String(through),
+      limit: String(limit),
+    });
+    if (after !== undefined) query.set('after', String(after));
+    return (
+      await request(`/api/seconds?${query}`, { signal }, false)
+    ).json() as Promise<HistoryPage>;
   },
 
   async loadDrawings(instrumentId) {

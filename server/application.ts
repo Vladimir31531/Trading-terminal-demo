@@ -200,6 +200,7 @@ export function createApplication(
             throw new HttpError(400, 'Неизвестный таймфрейм.');
           const before = timestamp(url.searchParams.get('before'));
           const after = timestamp(url.searchParams.get('after'));
+          const asOf = timestamp(url.searchParams.get('asOf'));
           if (before !== undefined && after !== undefined)
             throw new HttpError(
               400,
@@ -211,6 +212,7 @@ export function createApplication(
               400,
               'Размер порции должен быть от 1 до 2000 свечей.',
             );
+          if (asOf !== undefined) server?.timeout(request, 0);
           return json(
             await store.loadCandles(
               datasetId,
@@ -218,6 +220,36 @@ export function createApplication(
               before,
               limit,
               after,
+              asOf,
+              request.signal,
+            ),
+          );
+        }
+        if (request.method === 'GET' && path === '/api/seconds') {
+          const datasetId = text(
+            url.searchParams.get('datasetId'),
+            'набор данных',
+          );
+          const from = timestamp(url.searchParams.get('from'));
+          const through = timestamp(url.searchParams.get('through'));
+          const after = timestamp(url.searchParams.get('after'));
+          if (from === undefined || through === undefined)
+            throw new HttpError(400, 'Укажите диапазон симуляции.');
+          const limit = Number(url.searchParams.get('limit') ?? 2000);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 5000)
+            throw new HttpError(
+              400,
+              'Размер порции должен быть от 1 до 5000 свечей.',
+            );
+          server?.timeout(request, 0);
+          return json(
+            await store.loadSeconds(
+              datasetId,
+              from,
+              through,
+              after,
+              limit,
+              request.signal,
             ),
           );
         }

@@ -289,6 +289,44 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
+  flex-wrap: wrap;
+}
+.chart-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  min-width: 0;
+}
+.simulation-dialog {
+  width: 470px;
+  max-width: calc(100% - 32px);
+  padding: 26px;
+}
+.simulation-start,
+.simulation-stop {
+  font-size: 11px;
+}
+@media (max-width: 520px) {
+  .simulation-start,
+  .simulation-stop {
+    max-width: 100%;
+    white-space: normal;
+    height: auto;
+    min-height: 32px;
+  }
+  .simulation-controls {
+    max-width: 100%;
+  }
+  .simulation-datetime-row {
+    flex-wrap: wrap;
+  }
+  .simulation-date-trigger {
+    flex-basis: 100%;
+  }
+  .simulation-time-input {
+    width: 100%;
+  }
 }
 .eyebrow {
   display: block;

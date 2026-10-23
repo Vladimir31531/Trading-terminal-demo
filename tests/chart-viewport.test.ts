@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { MarketRepository } from '../src/application/market-repository';
 import { MAX_CACHED_CANDLES } from '../src/chart/history-window';
 import {
+  loadLatestHistory,
   loadViewportHistory,
   type TimeRange,
   viewportLogicalRange,
@@ -47,6 +48,36 @@ function repositoryFor(candles: Candle[]) {
 }
 
 describe('history for a retained timeframe viewport', () => {
+  test('catching up to replay retains a wide window using bounded service pages', async () => {
+    const candles = minuteBars(0, 8_000);
+    const { repository, calls } = repositoryFor(candles);
+    const result = await loadLatestHistory(
+      repository,
+      'dataset',
+      '1m',
+      MAX_CACHED_CANDLES,
+    );
+    expect(result.candles).toEqual(candles.slice(-MAX_CACHED_CANDLES));
+    expect(result.candles).toHaveLength(MAX_CACHED_CANDLES);
+    expect(calls.map((call) => call[3])).toEqual([1_600, 1_600]);
+    expect(result.hasMore).toBe(true);
+    expect(result.hasNewer).toBe(false);
+  });
+
+  test('a short replay history is returned without a redundant older request', async () => {
+    const candles = minuteBars(0, 80);
+    const { repository, calls } = repositoryFor(candles);
+    const result = await loadLatestHistory(
+      repository,
+      'dataset',
+      '1m',
+      MAX_CACHED_CANDLES,
+    );
+    expect(result.candles).toEqual(candles);
+    expect(calls).toHaveLength(1);
+    expect(result.hasMore).toBe(false);
+  });
+
   test('the first chart opens the latest page', async () => {
     const candles = minuteBars(0, 2_000);
     const { repository, calls } = repositoryFor(candles);

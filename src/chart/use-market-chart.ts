@@ -16,6 +16,7 @@ import {
 } from 'lightweight-charts-drawing';
 import { useEffect, useRef, useState } from 'react';
 import type { MarketRepository } from '../application/market-repository';
+import type { SimulationEngine } from '../application/simulation-engine';
 import type { Candle, Instrument, Timeframe } from '../domain/market';
 import { pricePrecision as decimalPlaces } from '../domain/price-precision';
 import { bindChartGestures } from './chart-gestures';
@@ -27,8 +28,10 @@ import {
   MAX_CACHED_CANDLES,
   mergeHistoryWindow,
 } from './history-window';
+import { advanceReplayWindow } from './replay-window';
 import type { RulerMeasurement } from './ruler';
 import {
+  loadLatestHistory,
   loadViewportHistory,
   type TimeRange,
   viewportLogicalRange,
@@ -57,6 +60,7 @@ export function useMarketChart(
   instrument: Instrument,
   timeframe: Timeframe,
   repository: MarketRepository,
+  simulation?: SimulationEngine,
 ) {
   const container = useRef<HTMLDivElement>(null);
   const session = useRef<ChartSession | null>(null);
@@ -64,6 +68,7 @@ export function useMarketChart(
   const viewport = useRef<{
     instrumentId: string;
     datasetId: string;
+    simulationId?: string;
     range?: TimeRange;
   }>({ instrumentId: instrument.id, datasetId: instrument.datasetId });
   const [loading, setLoading] = useState(true);
@@ -83,22 +88,43 @@ export function useMarketChart(
     if (!container.current) return;
     if (
       viewport.current.instrumentId !== instrument.id ||
-      viewport.current.datasetId !== instrument.datasetId
+      viewport.current.datasetId !== instrument.datasetId ||
+      viewport.current.simulationId !== simulation?.id
     ) {
       viewport.current = {
         instrumentId: instrument.id,
         datasetId: instrument.datasetId,
+        simulationId: simulation?.id,
       };
     }
     const initialRange = viewport.current.range;
     let disposed = false;
     let bars: Candle[] = [];
     let chartBars: OHLC[] = [];
+    let forming: Candle | undefined;
+    const operation = new AbortController();
+    const releaseBootstrap = simulation?.hold();
+    let unsubscribeReplay: (() => void) | undefined;
+    const history: Pick<MarketRepository, 'loadCandles'> = {
+      loadCandles: (datasetId, frame, before, limit, after) =>
+        repository.loadCandles(
+          datasetId,
+          frame,
+          before,
+          limit,
+          after,
+          simulation?.getSnapshot().time,
+          operation.signal,
+        ),
+    };
     let more = false;
     let newer = false;
+    let replayBehind = false;
     let fetching = false;
     let requestId = 0;
     let pendingHistory: ReturnType<typeof waitForHistoryIdle> | undefined;
+    let viewportIdle: ReturnType<typeof waitForHistoryIdle> | undefined;
+    let viewportBusy = false;
     const activePointers = new Set<number>();
     let previousRange: { from: number; to: number } | null = null;
     let initialized = false;
@@ -271,7 +297,7 @@ export function useMarketChart(
       setLoadingOlder(true);
       setError(undefined);
       try {
-        const page = await repository.loadCandles(
+        const page = await history.loadCandles(
           instrument.datasetId,
           timeframe,
           direction === 'older' ? bars[0].time : undefined,
@@ -297,8 +323,13 @@ export function useMarketChart(
           more = page.hasMore;
           newer ||= window.removedRight > 0;
         } else {
-          newer = page.hasNewer;
+          // Replay may have advanced while an older snapshot was in flight.
+          newer =
+            page.hasNewer ||
+            !!(forming && forming.time > (bars.at(-1)?.time ?? -Infinity));
           more ||= window.removedLeft > 0;
+          if (!newer && forming && bars.at(-1)?.time === forming.time)
+            bars[bars.length - 1] = forming;
         }
         setHasMore(more);
         updatePricePrecision(page.candles);
@@ -323,7 +354,7 @@ export function useMarketChart(
         }
       }
     };
-    const latest = async () => {
+    const latest = async (preserveView = false) => {
       if (disposed || !initialized) return;
       gestures.cancel();
       if (!newer && !fetching) {
@@ -334,28 +365,61 @@ export function useMarketChart(
       pendingHistory?.cancel();
       const currentRequest = ++requestId;
       fetching = true;
+      const release = simulation?.hold();
       setLoadingOlder(true);
       setError(undefined);
       try {
-        const page = await repository.loadCandles(
+        const page = await loadLatestHistory(
+          history,
           instrument.datasetId,
           timeframe,
-          undefined,
-          PAGE_SIZE,
+          preserveView ? Math.max(PAGE_SIZE, bars.length) : PAGE_SIZE,
         );
         if (disposed || currentRequest !== requestId) return;
+        let retainedRange: { from: number; to: number } | null = null;
+        if (preserveView) {
+          const idle = waitForHistoryIdle(
+            () => chart.timeScale().getVisibleLogicalRange(),
+            () => activePointers.size > 0,
+          );
+          pendingHistory = idle;
+          const ready = await idle.ready;
+          if (pendingHistory === idle) pendingHistory = undefined;
+          if (!ready || disposed || currentRequest !== requestId) return;
+          retainedRange = chart.timeScale().getVisibleLogicalRange();
+          if (retainedRange && retainedRange.to < bars.length - 1) return;
+        }
+        const previousCount = bars.length;
         bars = page.candles;
+        forming = bars.at(-1);
         more = page.hasMore;
         newer = page.hasNewer;
+        replayBehind = false;
         setHasMore(more);
         updatePricePrecision(bars);
         setSeriesData();
-        showLatest();
+        if (retainedRange) {
+          const offset = bars.length - previousCount;
+          viewportInteraction = false;
+          previousRange = {
+            from: retainedRange.from + offset,
+            to: retainedRange.to + offset,
+          };
+          chart.timeScale().setVisibleLogicalRange(previousRange);
+          const visible = chart.timeScale().getVisibleRange();
+          if (
+            visible &&
+            typeof visible.from === 'number' &&
+            typeof visible.to === 'number'
+          )
+            viewport.current.range = { from: visible.from, to: visible.to };
+        } else showLatest();
         setCandle(bars.at(-1));
         manager.redraw();
       } catch (cause) {
         if (currentRequest === requestId) reportError(cause);
       } finally {
+        release?.();
         if (currentRequest === requestId) {
           fetching = false;
           if (!disposed) setLoadingOlder(false);
@@ -394,6 +458,65 @@ export function useMarketChart(
       if (direction) void loadPage(direction);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
+
+    const replay = (seconds: readonly Candle[]) => {
+      if (disposed || !initialized) return;
+      const range = chart.timeScale().getVisibleLogicalRange();
+      const following =
+        !viewportBusy &&
+        !activePointers.size &&
+        (!range || range.to >= bars.length - 1);
+      const previousCount = bars.length;
+      const update = advanceReplayWindow(
+        bars,
+        forming,
+        seconds,
+        timeframe,
+        newer,
+        range,
+        viewportBusy || activePointers.size > 0,
+      );
+      forming = update.forming;
+      replayBehind ||= !newer && update.hasNewer;
+      newer = update.hasNewer;
+      if (!update.changes.length) return;
+      bars = update.candles;
+      if (update.removedLeft) {
+        more = true;
+        setHasMore(true);
+        setSeriesData();
+      } else {
+        for (const bar of update.changes) {
+          const next = { ...bar, time: bar.time as UTCTimestamp };
+          if (chartBars.at(-1)?.time === next.time)
+            chartBars[chartBars.length - 1] = next;
+          else chartBars.push(next);
+          series.update(next);
+        }
+        daySeparators?.setCandles(bars);
+        setLoadedCount(bars.length);
+      }
+      if (range) {
+        const offset =
+          (following ? bars.length + update.removedLeft - previousCount : 0) -
+          update.removedLeft;
+        if (offset) {
+          viewportInteraction = false;
+          previousRange = { from: range.from + offset, to: range.to + offset };
+          chart.timeScale().setVisibleLogicalRange(previousRange);
+          const visible = chart.timeScale().getVisibleRange();
+          if (
+            following &&
+            visible &&
+            typeof visible.from === 'number' &&
+            typeof visible.to === 'number'
+          )
+            viewport.current.range = { from: visible.from, to: visible.to };
+        }
+      } else showLatest();
+      setCandle(bars.at(-1));
+      manager.redraw();
+    };
     chart.subscribeCrosshairMove((event) => {
       const point = event.seriesData.get(series);
       const next =
@@ -436,12 +559,36 @@ export function useMarketChart(
     };
     const navigateViewport = () => {
       viewportInteraction = true;
+      if (!simulation) return;
+      viewportBusy = true;
+      viewportIdle?.cancel();
+      const idle = waitForHistoryIdle(
+        () => chart.timeScale().getVisibleLogicalRange(),
+        () => activePointers.size > 0,
+      );
+      viewportIdle = idle;
+      void idle.ready.then((ready) => {
+        if (!ready || viewportIdle !== idle || disposed) return;
+        viewportBusy = false;
+        const range = chart.timeScale().getVisibleLogicalRange();
+        if (
+          replayBehind &&
+          newer &&
+          !fetching &&
+          range &&
+          range.to >= bars.length - 1
+        )
+          void latest(true);
+      });
     };
     const dragViewport = (event: PointerEvent) => {
       if (event.buttons & 1) navigateViewport();
     };
     const startGesture = (event: PointerEvent) => {
-      if (event.button === 0) activePointers.add(event.pointerId);
+      if (event.button === 0) {
+        activePointers.add(event.pointerId);
+        if (simulation) navigateViewport();
+      }
     };
     const endGesture = (event: PointerEvent) => {
       activePointers.delete(event.pointerId);
@@ -480,12 +627,26 @@ export function useMarketChart(
     };
 
     void Promise.all([
-      loadViewportHistory(
-        repository,
-        instrument.datasetId,
-        timeframe,
-        initialRange,
-      ),
+      (async () => {
+        const page = await loadViewportHistory(
+          history,
+          instrument.datasetId,
+          timeframe,
+          initialRange,
+        );
+        forming =
+          simulation && page.hasNewer
+            ? (
+                await history.loadCandles(
+                  instrument.datasetId,
+                  timeframe,
+                  undefined,
+                  1,
+                )
+              ).candles.at(-1)
+            : page.candles.at(-1);
+        return page;
+      })(),
       repository.loadDrawings(instrument.id),
     ])
       .then(([page, drawings]) => {
@@ -517,18 +678,25 @@ export function useMarketChart(
         }
         if (drawings) manager.importJSON(drawings);
         initialized = true;
+        unsubscribeReplay = simulation?.onCandles(replay);
         setCandle(bars.at(-1));
         setLoading(false);
       })
       .catch((cause) => {
+        if (!disposed) simulation?.pause();
         reportError(cause);
         if (!disposed) setLoading(false);
-      });
+      })
+      .finally(() => releaseBootstrap?.());
 
     return () => {
       if (initialized && viewportInteraction) rememberViewport();
       disposed = true;
+      operation.abort();
+      unsubscribeReplay?.();
+      releaseBootstrap?.();
       pendingHistory?.cancel();
+      viewportIdle?.cancel();
       gestures.destroy();
       clearTimeout(saveTimer);
       saveDrawings();
@@ -554,6 +722,7 @@ export function useMarketChart(
     timeframe,
     repository,
     revision,
+    simulation,
   ]);
 
   return {
