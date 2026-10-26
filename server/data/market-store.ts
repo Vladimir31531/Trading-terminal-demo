@@ -21,13 +21,16 @@ import {
   TIMEFRAMES,
   type Timeframe,
 } from '../../src/domain/market';
-import { pricePrecision } from '../../src/domain/price-precision';
+import {
+  defaultPointSize,
+  pricePrecision,
+} from '../../src/domain/price-precision';
 import { CsvSourceError, readCsvSource, recordByteOffset } from './csv-source';
 
 const MAX_PAGE_SIZE = 5000;
 const SOURCE_INDEX_INTERVAL = 4096;
 const INSTRUMENT_COLUMNS =
-  'id, ticker, datasetId, fileName, fileSize, rowCount, firstTime, lastTime, createdAt, pricePrecision';
+  'id, ticker, datasetId, fileName, fileSize, rowCount, firstTime, lastTime, createdAt, pricePrecision, pointSize';
 
 export class MarketDataError extends Error {
   constructor(
@@ -53,6 +56,7 @@ export interface DiskImportInput {
   filePath: string;
   ticker: string;
   instrumentId?: string;
+  pointSize?: number;
 }
 
 export interface LocalMarketStoreOptions {
@@ -160,7 +164,8 @@ export class LocalMarketStore {
         firstTime REAL NOT NULL,
         lastTime REAL NOT NULL,
         createdAt INTEGER NOT NULL,
-        pricePrecision INTEGER NOT NULL
+        pricePrecision INTEGER NOT NULL,
+        pointSize REAL
       );
       CREATE TABLE IF NOT EXISTS candles (
         datasetId TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
@@ -193,6 +198,9 @@ export class LocalMarketStore {
     if (!columns.some((column) => column.name === 'pricePrecision')) {
       this.db.run('ALTER TABLE instruments ADD COLUMN pricePrecision INTEGER');
     }
+    if (!columns.some((column) => column.name === 'pointSize')) {
+      this.db.run('ALTER TABLE instruments ADD COLUMN pointSize REAL');
+    }
     if (recoverIncomplete) this.recoverIncompleteImports();
   }
 
@@ -221,10 +229,13 @@ export class LocalMarketStore {
   private backfillPricePrecision(): void {
     const instruments = this.db
       .query<Pick<Instrument, 'id' | 'datasetId'>, []>(
-        'SELECT id, datasetId FROM instruments WHERE pricePrecision IS NULL',
+        'SELECT id, datasetId FROM instruments WHERE pricePrecision IS NULL OR pointSize IS NULL',
       )
       .all();
     if (!instruments.length) return;
+    const stored = this.db.query<Pick<Instrument, 'pricePrecision'>, [string]>(
+      'SELECT pricePrecision FROM instruments WHERE id = ?',
+    );
     const candles = this.db.query<
       Pick<Candle, 'open' | 'high' | 'low' | 'close'>,
       [string]
@@ -232,27 +243,48 @@ export class LocalMarketStore {
       "SELECT open, high, low, close FROM candles WHERE datasetId = ? AND timeframe = '1m'",
     );
     const update = this.db.query(
-      'UPDATE instruments SET pricePrecision = ? WHERE id = ? AND datasetId = ? AND pricePrecision IS NULL',
+      'UPDATE instruments SET pricePrecision = COALESCE(pricePrecision, ?), pointSize = COALESCE(pointSize, ?) WHERE id = ? AND datasetId = ?',
     );
     for (const instrument of instruments) {
-      let precision = 0;
-      for (const candle of candles.iterate(instrument.datasetId)) {
-        precision = Math.max(precision, candlePricePrecision(candle));
-        if (precision === 8) break;
+      const existing = stored.get(instrument.id)?.pricePrecision;
+      let precision = existing ?? 0;
+      if (existing === null || existing === undefined) {
+        for (const candle of candles.iterate(instrument.datasetId)) {
+          precision = Math.max(precision, candlePricePrecision(candle));
+          if (precision === 8) break;
+        }
       }
-      update.run(precision, instrument.id, instrument.datasetId);
+      update.run(
+        precision,
+        defaultPointSize(precision),
+        instrument.id,
+        instrument.datasetId,
+      );
     }
   }
 
-  renameInstrument(id: string, ticker: string): void {
+  updateInstrument(id: string, ticker: string, pointSize: number): Instrument {
+    if (!Number.isFinite(pointSize) || pointSize <= 0)
+      throw new MarketDataError('Размер пункта должен быть больше нуля.');
     const updated = this.db
-      .query('UPDATE instruments SET ticker = ? WHERE id = ?')
+      .query('UPDATE instruments SET ticker = ?, pointSize = ? WHERE id = ?')
       .run(
         validate(() => normalizeTicker(ticker)),
+        pointSize,
         id,
       );
     if (!updated.changes)
       throw new MarketDataError('Инструмент больше не существует.', 404);
+    return this.instrument(id);
+  }
+
+  renameInstrument(id: string, ticker: string): void {
+    const instrument = this.instrument(id);
+    this.updateInstrument(
+      id,
+      ticker,
+      instrument.pointSize ?? defaultPointSize(instrument.pricePrecision ?? 0),
+    );
   }
 
   deleteInstrument(id: string): void {
@@ -322,7 +354,13 @@ export class LocalMarketStore {
         fileSize: source.sourceSize,
         ...stats,
         createdAt: existing?.createdAt ?? Date.now(),
+        pointSize:
+          input.pointSize ??
+          existing?.pointSize ??
+          defaultPointSize(stats.pricePrecision),
       };
+      if (!Number.isFinite(instrument.pointSize) || instrument.pointSize <= 0)
+        throw new MarketDataError('Размер пункта должен быть больше нуля.');
       this.db.transaction(() => {
         if (
           existing &&
@@ -335,11 +373,11 @@ export class LocalMarketStore {
         }
         this.db
           .query(`
-          INSERT INTO instruments (${INSTRUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO instruments (${INSTRUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET ticker=excluded.ticker, datasetId=excluded.datasetId,
             fileName=excluded.fileName, fileSize=excluded.fileSize, rowCount=excluded.rowCount,
             firstTime=excluded.firstTime, lastTime=excluded.lastTime,
-            pricePrecision=excluded.pricePrecision
+            pricePrecision=excluded.pricePrecision, pointSize=excluded.pointSize
         `)
           .run(
             instrument.id,
@@ -352,6 +390,7 @@ export class LocalMarketStore {
             instrument.lastTime,
             instrument.createdAt,
             stats.pricePrecision,
+            instrument.pointSize,
           );
         if (existing) this.cancelIndex(existing.datasetId);
         if (existing)

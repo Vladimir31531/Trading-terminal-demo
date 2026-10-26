@@ -203,11 +203,12 @@ export const marketRepository: MarketRepository = {
 
   importInstrument,
 
-  async renameInstrument(id, ticker) {
-    await request(
+  async updateInstrument(id, ticker, pointSize) {
+    const response = await request(
       `/api/instruments/${encodeURIComponent(id)}`,
-      jsonOptions('PATCH', { ticker: normalizeTicker(ticker) }),
+      jsonOptions('PATCH', { ticker: normalizeTicker(ticker), pointSize }),
     );
+    return (await response.json()) as Instrument;
   },
 
   async deleteInstrument(id) {

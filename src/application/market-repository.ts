@@ -18,7 +18,11 @@ export interface MarketRepository {
     onProgress: (progress: ImportProgress) => void,
     signal?: AbortSignal,
   ): Promise<Instrument>;
-  renameInstrument(id: string, ticker: string): Promise<void>;
+  updateInstrument(
+    id: string,
+    ticker: string,
+    pointSize: number,
+  ): Promise<Instrument>;
   deleteInstrument(id: string): Promise<void>;
   loadCandles(
     datasetId: string,

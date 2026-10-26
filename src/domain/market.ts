@@ -31,6 +31,8 @@ export interface Instrument {
   createdAt: number;
   /** Decimal resolution of all source OHLC prices, up to eight digits. */
   pricePrecision?: number;
+  /** Price movement represented by one trading point for this instrument. */
+  pointSize: number;
 }
 
 export interface ImportProgress {
@@ -43,6 +45,7 @@ export interface ImportInput {
   ticker: string;
   sourceId: string;
   instrumentId?: string;
+  pointSize?: number;
 }
 
 export interface SourceFile {

@@ -3,6 +3,7 @@ import {
   ChartCandlestick,
   Database,
   HardDrive,
+  History,
   LoaderCircle,
   Pencil,
   Play,
@@ -10,17 +11,26 @@ import {
   RefreshCw,
   Trash2,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { SimulationEngine } from './application/simulation-engine';
+import { TradingEngine } from './application/trading-engine';
 import { DeleteInstrumentDialog } from './components/DeleteInstrumentDialog';
 import { InstrumentDialog } from './components/InstrumentDialog';
 import { MarketChart } from './components/MarketChart';
 import { SimulationControls } from './components/SimulationControls';
 import { SimulationDialog } from './components/SimulationDialog';
+import { TradingControls } from './components/TradingControls';
+import { TradingSessionsPage } from './components/TradingSessionsPage';
 import { Button } from './components/ui/button';
 import { type Instrument, TIMEFRAMES, type Timeframe } from './domain/market';
 import type { SimulationSettings } from './domain/simulation';
+import { type TradingSession, validateInitialBalance } from './domain/trading';
 import { marketRepository } from './infrastructure/market-repository';
+import { tradingHistory } from './infrastructure/trading-history';
+import {
+  loadPointValue,
+  savePointValue,
+} from './infrastructure/trading-preferences';
 
 const numberFormat = new Intl.NumberFormat('ru-RU');
 const dateFormat = new Intl.DateTimeFormat('ru-RU', {
@@ -45,33 +55,106 @@ export default function App() {
   const [deletingInstrument, setDeletingInstrument] = useState<Instrument>();
   const [simulationDialogOpen, setSimulationDialogOpen] = useState(false);
   const [simulation, setSimulation] = useState<SimulationEngine>();
+  const [trading, setTrading] = useState<TradingEngine>();
+  const [page, setPage] = useState<'chart' | 'sessions'>('chart');
+  const [tradeVolume, setTradeVolume] = useState('0.01');
+  const [pointValues, setPointValues] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+  const pointValue = useMemo(
+    () =>
+      selectedId
+        ? (pointValues.get(selectedId) ?? loadPointValue(selectedId))
+        : '1',
+    [selectedId, pointValues],
+  );
   const selected = instruments.find((item) => item.id === selectedId);
   const activeSimulation =
     simulation?.datasetId === selected?.datasetId ? simulation : undefined;
+  const activeTrading = activeSimulation ? trading : undefined;
 
-  useEffect(() => () => simulation?.destroy(), [simulation]);
+  useEffect(
+    () => () => {
+      simulation?.destroy();
+      void trading?.finish(simulation?.getSnapshot().time);
+    },
+    [simulation, trading],
+  );
   useEffect(() => {
     if (simulation && simulation.datasetId !== selected?.datasetId) {
+      void trading?.finish(simulation.getSnapshot().time);
       simulation.destroy();
       setSimulation(undefined);
+      setTrading(undefined);
     }
-  }, [simulation, selected?.datasetId]);
+  }, [simulation, selected?.datasetId, trading]);
 
-  function startSimulation(settings: SimulationSettings) {
+  async function startSimulation(
+    settings: SimulationSettings,
+    initialBalance: number,
+  ): Promise<void> {
     if (!selected) return;
-    simulation?.destroy();
+    validateInitialBalance(initialBalance);
+    const initialPointValue = Number(pointValue);
+    if (!Number.isFinite(initialPointValue) || initialPointValue <= 0)
+      throw new Error('Цена пункта должна быть числом больше нуля.');
+    const session: TradingSession = {
+      id: crypto.randomUUID(),
+      instrumentId: selected.id,
+      datasetId: selected.datasetId,
+      ticker: selected.ticker,
+      startedAt: Date.now(),
+      tradeCount: 0,
+      totalProfit: 0,
+      initialBalance,
+      balance: initialBalance,
+      simulationStartTime: settings.startTime,
+    };
     const next = new SimulationEngine(
       selected.datasetId,
       settings,
       marketRepository,
     );
+    const nextTrading = new TradingEngine(session, selected, tradingHistory);
+    nextTrading.setPointValuePer001(initialPointValue);
+    try {
+      await tradingHistory.startSession(session);
+    } catch (cause) {
+      next.destroy();
+      throw cause;
+    }
+    nextTrading.connect(next);
+    simulation?.destroy();
+    setTrading(nextTrading);
     setSimulation(next);
     next.start();
   }
 
-  function stopSimulation() {
+  function updatePointValue(value: string) {
+    if (!selectedId) return;
+    setPointValues((current) => new Map(current).set(selectedId, value));
+    savePointValue(selectedId, value);
+  }
+
+  async function stopSimulation() {
+    simulation?.pause();
+    await trading?.finish(simulation?.getSnapshot().time);
+    if (trading?.getSnapshot().error) return;
     simulation?.destroy();
     setSimulation(undefined);
+    setTrading(undefined);
+  }
+
+  async function stopSessionBeforeDelete(sessionId: string): Promise<void> {
+    if (trading?.getSnapshot().sessionId !== sessionId) return;
+    simulation?.pause();
+    const time = simulation?.getSnapshot().time;
+    await trading.finish(time);
+    const persistenceError = trading.getSnapshot().error;
+    if (persistenceError) throw new Error(persistenceError);
+    simulation?.destroy();
+    setSimulation(undefined);
+    setTrading(undefined);
   }
 
   const refresh = useCallback(async (preferredId?: string) => {
@@ -231,6 +314,15 @@ export default function App() {
               </ul>
             )}
           </div>
+          <button
+            type="button"
+            className={`sidebar-history-link ${page === 'sessions' ? 'is-active' : ''}`}
+            aria-current={page === 'sessions' ? 'page' : undefined}
+            onClick={() => setPage('sessions')}
+          >
+            <History size={15} strokeWidth={1.5} />
+            <span>Торговые сессии</span>
+          </button>
           <div className="sidebar-footer">
             <HardDrive size={15} strokeWidth={1.5} />
             <div>
@@ -240,142 +332,169 @@ export default function App() {
           </div>
         </aside>
         <main className="main-panel">
-          <div className="chart-header">
-            <div className="chart-heading">
-              <h1>
-                {selected?.ticker ?? 'Графики'}
-                {selected && <span className="chart-type-label">OHLC</span>}
-              </h1>
-              {selected &&
-                (activeSimulation ? (
-                  <SimulationControls
-                    engine={activeSimulation}
-                    onStop={stopSimulation}
+          {page === 'sessions' ? (
+            <TradingSessionsPage
+              onBack={() => setPage('chart')}
+              onBeforeDelete={stopSessionBeforeDelete}
+            />
+          ) : (
+            <>
+              <div className="chart-header">
+                <div className="chart-heading">
+                  <h1>
+                    {selected?.ticker ?? 'Графики'}
+                    {selected && <span className="chart-type-label">OHLC</span>}
+                  </h1>
+                  {selected &&
+                    (activeSimulation ? (
+                      <>
+                        <SimulationControls
+                          engine={activeSimulation}
+                          onStop={stopSimulation}
+                        />
+                        {activeTrading && (
+                          <TradingControls
+                            engine={activeTrading}
+                            volume={tradeVolume}
+                            onVolumeChange={setTradeVolume}
+                            pointValue={pointValue}
+                            onPointValueChange={updatePointValue}
+                          />
+                        )}
+                      </>
+                    ) : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="simulation-start"
+                        onClick={() => setSimulationDialogOpen(true)}
+                      >
+                        <Play className="size-3.5" /> Начать симуляцию
+                      </Button>
+                    ))}
+                </div>
+                {selected ? (
+                  <fieldset className="timeframe-group" aria-label="Таймфрейм">
+                    {TIMEFRAMES.map((item) => (
+                      <Button
+                        key={item}
+                        variant="ghost"
+                        size="sm"
+                        aria-pressed={item === timeframe}
+                        className={`timeframe-button ${item === timeframe ? 'is-selected' : ''}`}
+                        onClick={() => setTimeframe(item)}
+                      >
+                        {item}
+                      </Button>
+                    ))}
+                  </fieldset>
+                ) : (
+                  <span className="history-badge">
+                    <span />
+                    Исторические данные
+                  </span>
+                )}
+              </div>
+              <div className="chart-content">
+                {loading ? (
+                  <div className="center-state">
+                    <LoaderCircle size={24} className="animate-spin" />
+                    <p>Открываем рабочее пространство…</p>
+                  </div>
+                ) : error ? (
+                  <div className="center-state error-state">
+                    <Database size={28} strokeWidth={1.3} />
+                    <h2>История недоступна</h2>
+                    <p role="alert">{error}</p>
+                    <Button variant="outline" onClick={() => void retry()}>
+                      <RefreshCw size={15} />
+                      Попробовать снова
+                    </Button>
+                  </div>
+                ) : selected ? (
+                  <MarketChart
+                    key={`${selected.id}:${selected.datasetId}`}
+                    instrument={selected}
+                    timeframe={timeframe}
+                    repository={marketRepository}
+                    simulation={activeSimulation}
+                    trading={activeTrading}
+                    tradeVolume={Number(tradeVolume)}
                   />
                 ) : (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="simulation-start"
-                    onClick={() => setSimulationDialogOpen(true)}
-                  >
-                    <Play className="size-3.5" /> Начать симуляцию
-                  </Button>
-                ))}
-            </div>
-            {selected ? (
-              <fieldset className="timeframe-group" aria-label="Таймфрейм">
-                {TIMEFRAMES.map((item) => (
-                  <Button
-                    key={item}
-                    variant="ghost"
-                    size="sm"
-                    aria-pressed={item === timeframe}
-                    className={`timeframe-button ${item === timeframe ? 'is-selected' : ''}`}
-                    onClick={() => setTimeframe(item)}
-                  >
-                    {item}
-                  </Button>
-                ))}
-              </fieldset>
-            ) : (
-              <span className="history-badge">
-                <span />
-                Исторические данные
-              </span>
-            )}
-          </div>
-          <div className="chart-content">
-            {loading ? (
-              <div className="center-state">
-                <LoaderCircle size={24} className="animate-spin" />
-                <p>Открываем рабочее пространство…</p>
+                  <div className="empty-workspace">
+                    <div className="empty-chart-art" aria-hidden="true">
+                      <div className="art-grid" />
+                      <svg viewBox="0 0 280 112" fill="none" aria-hidden="true">
+                        <path
+                          d="M25 72V103M25 78V93M55 42V91M55 51V78M85 55V90M85 62V81M115 27V72M115 35V58M145 45V78M145 52V68M175 18V62M175 26V49M205 9V48M205 17V35M235 21V58M235 28V48"
+                          stroke="currentColor"
+                          strokeWidth="1"
+                        />
+                        <path
+                          d="M19 78H31V93H19ZM79 62H91V81H79ZM139 52H151V68H139ZM229 28H241V48H229Z"
+                          fill="currentColor"
+                        />
+                        <path
+                          d="M49 51H61V78H49ZM109 35H121V58H109ZM169 26H181V49H169ZM199 17H211V35H199Z"
+                          fill="white"
+                          stroke="currentColor"
+                        />
+                      </svg>
+                      <span className="art-corner">OHLC / UTC</span>
+                    </div>
+                    <div className="empty-copy">
+                      <span className="eyebrow">ВАШ РЫНОК. ВАША ИСТОРИЯ.</span>
+                      <h2>Всё начинается с графика</h2>
+                      <p>Добавьте инструмент и подключите CSV с диска.</p>
+                    </div>
+                    <Button
+                      className="empty-import"
+                      onClick={() => openImport()}
+                    >
+                      <Plus size={16} />
+                      Добавить инструмент
+                      <ArrowUpRight size={15} className="empty-arrow" />
+                    </Button>
+                  </div>
+                )}
               </div>
-            ) : error ? (
-              <div className="center-state error-state">
-                <Database size={28} strokeWidth={1.3} />
-                <h2>История недоступна</h2>
-                <p role="alert">{error}</p>
-                <Button variant="outline" onClick={() => void retry()}>
-                  <RefreshCw size={15} />
-                  Попробовать снова
-                </Button>
-              </div>
-            ) : selected ? (
-              <MarketChart
-                key={`${selected.id}:${selected.datasetId}`}
-                instrument={selected}
-                timeframe={timeframe}
-                repository={marketRepository}
-                simulation={activeSimulation}
-              />
-            ) : (
-              <div className="empty-workspace">
-                <div className="empty-chart-art" aria-hidden="true">
-                  <div className="art-grid" />
-                  <svg viewBox="0 0 280 112" fill="none" aria-hidden="true">
-                    <path
-                      d="M25 72V103M25 78V93M55 42V91M55 51V78M85 55V90M85 62V81M115 27V72M115 35V58M145 45V78M145 52V68M175 18V62M175 26V49M205 9V48M205 17V35M235 21V58M235 28V48"
-                      stroke="currentColor"
-                      strokeWidth="1"
-                    />
-                    <path
-                      d="M19 78H31V93H19ZM79 62H91V81H79ZM139 52H151V68H139ZM229 28H241V48H229Z"
-                      fill="currentColor"
-                    />
-                    <path
-                      d="M49 51H61V78H49ZM109 35H121V58H109ZM169 26H181V49H169ZM199 17H211V35H199Z"
-                      fill="white"
-                      stroke="currentColor"
-                    />
-                  </svg>
-                  <span className="art-corner">OHLC / UTC</span>
+              <footer className="chart-footer">
+                <div className="footer-left">
+                  <span className="footer-status-dot" />
+                  <span>
+                    {selected
+                      ? activeSimulation
+                        ? 'Симуляция'
+                        : 'История загружена'
+                      : ''}
+                  </span>
+                  {selected && (
+                    <span className="footer-file" title={selected.fileName}>
+                      {selected.fileName}
+                    </span>
+                  )}
                 </div>
-                <div className="empty-copy">
-                  <span className="eyebrow">ВАШ РЫНОК. ВАША ИСТОРИЯ.</span>
-                  <h2>Всё начинается с графика</h2>
-                  <p>Добавьте инструмент и подключите CSV с диска.</p>
+                <div className="footer-right">
+                  <a
+                    href="https://www.tradingview.com/"
+                    target="_blank"
+                    rel="noreferrer"
+                    title="TradingView Lightweight Charts™ — Copyright (с) 2025 TradingView, Inc."
+                  >
+                    © 2025 TradingView, Inc.
+                  </a>
+                  {selected && (
+                    <span className="footer-date-range">
+                      {dateRange(selected)}
+                    </span>
+                  )}
+                  <span className="utc-badge">UTC+0</span>
                 </div>
-                <Button className="empty-import" onClick={() => openImport()}>
-                  <Plus size={16} />
-                  Добавить инструмент
-                  <ArrowUpRight size={15} className="empty-arrow" />
-                </Button>
-              </div>
-            )}
-          </div>
-          <footer className="chart-footer">
-            <div className="footer-left">
-              <span className="footer-status-dot" />
-              <span>
-                {selected
-                  ? activeSimulation
-                    ? 'Симуляция'
-                    : 'История загружена'
-                  : ''}
-              </span>
-              {selected && (
-                <span className="footer-file" title={selected.fileName}>
-                  {selected.fileName}
-                </span>
-              )}
-            </div>
-            <div className="footer-right">
-              <a
-                href="https://www.tradingview.com/"
-                target="_blank"
-                rel="noreferrer"
-                title="TradingView Lightweight Charts™ — Copyright (с) 2025 TradingView, Inc."
-              >
-                © 2025 TradingView, Inc.
-              </a>
-              {selected && (
-                <span className="footer-date-range">{dateRange(selected)}</span>
-              )}
-              <span className="utc-badge">UTC+0</span>
-            </div>
-          </footer>
+              </footer>
+            </>
+          )}
         </main>
       </div>
       <InstrumentDialog

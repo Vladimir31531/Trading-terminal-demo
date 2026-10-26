@@ -31,6 +31,7 @@ export function InstrumentDialog({
   onSaved,
 }: InstrumentDialogProps) {
   const [ticker, setTicker] = useState('');
+  const [pointSize, setPointSize] = useState('0.001');
   const [file, setFile] = useState<SourceFile>();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [error, setError] = useState<string>();
@@ -41,6 +42,12 @@ export function InstrumentDialog({
   useEffect(() => {
     if (open) {
       setTicker(instrument?.ticker ?? '');
+      setPointSize(
+        String(
+          instrument?.pointSize ??
+            10 ** -Math.max(0, Math.min(8, instrument?.pricePrecision ?? 3)),
+        ),
+      );
       setFile(undefined);
       setError(undefined);
       setProgress(undefined);
@@ -72,6 +79,11 @@ export function InstrumentDialog({
       setError('Укажите тикер инструмента.');
       return;
     }
+    const normalizedPointSize = Number(pointSize);
+    if (!Number.isFinite(normalizedPointSize) || normalizedPointSize <= 0) {
+      setError('Размер одного пункта должен быть числом больше нуля.');
+      return;
+    }
     if (!instrument && !file) {
       setError('Выберите CSV с историей инструмента.');
       return;
@@ -84,13 +96,24 @@ export function InstrumentDialog({
       let instrumentId = instrument?.id;
       if (file) {
         const saved = await repository.importInstrument(
-          { ticker: normalizedTicker, sourceId: file.id, instrumentId },
+          {
+            ticker: normalizedTicker,
+            sourceId: file.id,
+            instrumentId,
+            pointSize: normalizedPointSize,
+          },
           setProgress,
           operation.signal,
         );
+        verifySavedPointSize(saved, normalizedPointSize);
         instrumentId = saved.id;
       } else if (instrumentId) {
-        await repository.renameInstrument(instrumentId, normalizedTicker);
+        const saved = await repository.updateInstrument(
+          instrumentId,
+          normalizedTicker,
+          normalizedPointSize,
+        );
+        verifySavedPointSize(saved, normalizedPointSize);
       }
       if (instrumentId) await onSaved(instrumentId);
       onOpenChange(false);
@@ -150,6 +173,25 @@ export function InstrumentDialog({
               disabled={busy}
               required
             />
+          </div>
+          <div className="form-field">
+            <Label htmlFor="instrument-point-size">
+              Размер одного пункта в цене
+            </Label>
+            <Input
+              id="instrument-point-size"
+              type="number"
+              min="0"
+              step="any"
+              value={pointSize}
+              onChange={(event) => setPointSize(event.target.value)}
+              disabled={busy}
+              required
+            />
+            <p className="format-help">
+              Например, 0.001 означает, что движение цены на 0.001 равно одному
+              пункту.
+            </p>
           </div>
           <div className="form-field">
             <div className="file-label-row">
@@ -261,4 +303,14 @@ export function InstrumentDialog({
       />
     </Dialog>
   );
+}
+
+function verifySavedPointSize(
+  instrument: Instrument,
+  expectedPointSize: number,
+): void {
+  if (instrument.pointSize !== expectedPointSize)
+    throw new Error(
+      'Локальный сервис не подтвердил размер пункта. Остановите старый экземпляр через Ctrl+C, перезапустите проект и сохраните инструмент ещё раз.',
+    );
 }

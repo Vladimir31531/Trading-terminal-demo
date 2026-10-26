@@ -14,11 +14,13 @@ import {
   makeCoords,
   type OHLC,
 } from 'lightweight-charts-drawing';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MarketRepository } from '../application/market-repository';
 import type { SimulationEngine } from '../application/simulation-engine';
+import type { TradingEngine } from '../application/trading-engine';
 import type { Candle, Instrument, Timeframe } from '../domain/market';
 import { pricePrecision as decimalPlaces } from '../domain/price-precision';
+import type { TradeOrder, TradeProtection, TradeSide } from '../domain/trading';
 import { bindChartGestures } from './chart-gestures';
 import { DaySeparators } from './day-separators';
 import { waitForHistoryIdle } from './history-idle';
@@ -30,6 +32,7 @@ import {
 } from './history-window';
 import { advanceReplayWindow } from './replay-window';
 import type { RulerMeasurement } from './ruler';
+import { TradeHistory, type TradeHistoryLayout } from './trade-history';
 import {
   loadLatestHistory,
   loadViewportHistory,
@@ -51,6 +54,7 @@ const utcDate = new Intl.DateTimeFormat('ru-RU', {
 
 interface ChartSession {
   manager: DrawingManager;
+  priceToCoordinate(price: number): number | null;
   latest(): void;
   toggleCrosshair(): void;
   cancelGesture(): void;
@@ -61,6 +65,9 @@ export function useMarketChart(
   timeframe: Timeframe,
   repository: MarketRepository,
   simulation?: SimulationEngine,
+  trading?: TradingEngine,
+  tradeVolume = 0.01,
+  onEditTrade?: (order: TradeOrder) => void,
 ) {
   const container = useRef<HTMLDivElement>(null);
   const session = useRef<ChartSession | null>(null);
@@ -82,6 +89,25 @@ export function useMarketChart(
   const [loadedCount, setLoadedCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [revision, setRevision] = useState(0);
+  const [coordinateRevision, setCoordinateRevision] = useState(0);
+  const [tradeHistoryLayout, setTradeHistoryLayout] =
+    useState<TradeHistoryLayout>({
+      width: 0,
+      height: 0,
+      markers: [],
+    });
+  const [tradeMenu, setTradeMenu] = useState<{
+    x: number;
+    y: number;
+    price: number;
+    side: TradeSide;
+    volume: number;
+  }>();
+  const [tradeError, setTradeError] = useState<string>();
+  const closeTradeMenu = useCallback(() => setTradeMenu(undefined), []);
+  const clearTradeError = useCallback(() => setTradeError(undefined), []);
+  const tradeOptions = useRef({ trading, tradeVolume, onEditTrade });
+  tradeOptions.current = { trading, tradeVolume, onEditTrade };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: revision explicitly retries chart initialization after a load error.
   useEffect(() => {
@@ -144,6 +170,7 @@ export function useMarketChart(
     setMeasurement(undefined);
     setLoadedCount(0);
     setHasMore(false);
+    setTradeHistoryLayout({ width: 0, height: 0, markers: [] });
 
     const reportError = (cause: unknown) => {
       if (!disposed)
@@ -200,7 +227,25 @@ export function useMarketChart(
       wickDownColor: '#000000',
       priceLineColor: '#737373',
     });
+    const tradeHistory = new TradeHistory(
+      chart,
+      timeframe,
+      (price) => series.priceToCoordinate(price),
+      (layout) => {
+        if (!disposed) setTradeHistoryLayout(layout);
+      },
+    );
     const pane = series.getPane();
+    pane.attachPrimitive(tradeHistory);
+    let markerCount = -1;
+    const syncTradeMarkers = () => {
+      const markers = trading?.getSnapshot().markers ?? [];
+      if (markers.length === markerCount) return;
+      markerCount = markers.length;
+      tradeHistory.setMarkers(markers);
+    };
+    syncTradeMarkers();
+    const unsubscribeTrading = trading?.subscribe(syncTradeMarkers);
     const daySeparators = !['1D', '1W', '1M'].includes(timeframe)
       ? new DaySeparators(chart)
       : undefined;
@@ -213,6 +258,16 @@ export function useMarketChart(
         intraday: !['1D', '1W', '1M'].includes(timeframe),
       }),
     });
+    let tradeDrag:
+      | {
+          pointerId: number;
+          id: string;
+          level: 'entry' | TradeProtection;
+          ctrl: boolean;
+          stopLoss?: number;
+          takeProfit?: number;
+        }
+      | undefined;
 
     const saveDrawings = () => {
       if (!initialized) return;
@@ -447,6 +502,7 @@ export function useMarketChart(
     };
     const onRange = (range: LogicalRange | null) => {
       if (!range || disposed) return;
+      setCoordinateRevision((value) => value + 1);
       rememberViewport();
       const previous = previousRange;
       previousRange = range;
@@ -480,6 +536,7 @@ export function useMarketChart(
       replayBehind ||= !newer && update.hasNewer;
       newer = update.hasNewer;
       if (!update.changes.length) return;
+      setCoordinateRevision((value) => value + 1);
       bars = update.candles;
       if (update.removedLeft) {
         more = true;
@@ -515,6 +572,7 @@ export function useMarketChart(
         }
       } else showLatest();
       setCandle(bars.at(-1));
+      syncTradeMarkers();
       manager.redraw();
     };
     chart.subscribeCrosshairMove((event) => {
@@ -557,6 +615,37 @@ export function useMarketChart(
     const preventAutoscroll = (event: MouseEvent) => {
       if (event.button === 1) event.preventDefault();
     };
+    const beginTradeDrag = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const handle = target.closest<HTMLElement>(
+        '[data-trade-id][data-trade-level]',
+      );
+      const engine = tradeOptions.current.trading;
+      if (!handle || !engine) return;
+      const order = engine
+        .getSnapshot()
+        .orders.find((item) => item.id === handle.dataset.tradeId);
+      const level = handle.dataset.tradeLevel;
+      if (!order || !['entry', 'stopLoss', 'takeProfit'].includes(level ?? ''))
+        return;
+      if (level === 'entry' && order.status === 'open' && !event.ctrlKey)
+        return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      tradeDrag = {
+        pointerId: event.pointerId,
+        id: order.id,
+        level: level as 'entry' | TradeProtection,
+        ctrl: event.ctrlKey,
+        stopLoss: order.stopLoss,
+        takeProfit: order.takeProfit,
+      };
+      activePointers.add(event.pointerId);
+      handle.setPointerCapture(event.pointerId);
+      setTradeError(undefined);
+    };
     const navigateViewport = () => {
       viewportInteraction = true;
       if (!simulation) return;
@@ -582,6 +671,46 @@ export function useMarketChart(
       });
     };
     const dragViewport = (event: PointerEvent) => {
+      if (tradeDrag?.pointerId === event.pointerId) {
+        const drag = tradeDrag;
+        const engine = tradeOptions.current.trading;
+        const bounds = host.getBoundingClientRect();
+        const price = series.coordinateToPrice(event.clientY - bounds.top);
+        const order = engine
+          ?.getSnapshot()
+          .orders.find((item) => item.id === drag.id);
+        if (!engine || !order || price === null) return;
+        try {
+          if (drag.level === 'entry' && drag.ctrl) {
+            const higher = price > order.price;
+            const field: TradeProtection =
+              order.side === 'buy'
+                ? higher
+                  ? 'takeProfit'
+                  : 'stopLoss'
+                : higher
+                  ? 'stopLoss'
+                  : 'takeProfit';
+            if (price === order.price) return;
+            engine.editOrder(order.id, {
+              stopLoss: field === 'stopLoss' ? price : drag.stopLoss,
+              takeProfit: field === 'takeProfit' ? price : drag.takeProfit,
+            });
+          } else if (drag.level === 'entry' && order.status === 'pending') {
+            engine.editOrder(order.id, { price });
+          } else if (drag.level !== 'entry') {
+            engine.setProtection(order.id, drag.level, price);
+          }
+          setTradeError(undefined);
+        } catch (cause) {
+          setTradeError(
+            cause instanceof Error
+              ? cause.message
+              : 'Не удалось переместить уровень ордера.',
+          );
+        }
+        return;
+      }
       if (event.buttons & 1) navigateViewport();
     };
     const startGesture = (event: PointerEvent) => {
@@ -592,8 +721,64 @@ export function useMarketChart(
     };
     const endGesture = (event: PointerEvent) => {
       activePointers.delete(event.pointerId);
+      if (tradeDrag?.pointerId === event.pointerId) tradeDrag = undefined;
     };
-    const resetGestures = () => activePointers.clear();
+    const resetGestures = () => {
+      activePointers.clear();
+      tradeDrag = undefined;
+    };
+    const contextMenu = (event: MouseEvent) => {
+      const { trading: engine, tradeVolume: volume } = tradeOptions.current;
+      if (!engine) return;
+      const tradingSnapshot = engine.getSnapshot();
+      const currentPrice = tradingSnapshot.currentPrice;
+      const bounds = host.getBoundingClientRect();
+      const price = series.coordinateToPrice(event.clientY - bounds.top);
+      if (
+        tradingSnapshot.finished ||
+        currentPrice === undefined ||
+        price === null
+      )
+        return;
+      event.preventDefault();
+      setTradeError(undefined);
+      setTradeMenu({
+        x: Math.max(
+          8,
+          Math.min(event.clientX - bounds.left + 8, bounds.width - 190),
+        ),
+        y: Math.max(
+          8,
+          Math.min(event.clientY - bounds.top, bounds.height - 56),
+        ),
+        price,
+        side: price <= currentPrice ? 'buy' : 'sell',
+        volume,
+      });
+    };
+    const doubleClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element) {
+        const handle = target.closest<HTMLElement>(
+          '[data-trade-id][data-trade-level="entry"]',
+        );
+        const order = tradeOptions.current.trading
+          ?.getSnapshot()
+          .orders.find((item) => item.id === handle?.dataset.tradeId);
+        if (order) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          tradeOptions.current.onEditTrade?.(order);
+          return;
+        }
+      }
+      navigateViewport();
+    };
+    const resizeObserver = new ResizeObserver(() =>
+      setCoordinateRevision((value) => value + 1),
+    );
+    resizeObserver.observe(host);
+    host.addEventListener('pointerdown', beginTradeDrag, true);
     host.addEventListener('pointerdown', middleDown, true);
     host.addEventListener('pointerdown', startGesture, true);
     window.addEventListener('pointerup', endGesture, true);
@@ -606,7 +791,8 @@ export function useMarketChart(
       passive: true,
     });
     host.addEventListener('pointermove', dragViewport, true);
-    host.addEventListener('dblclick', navigateViewport, true);
+    host.addEventListener('dblclick', doubleClick, true);
+    host.addEventListener('contextmenu', contextMenu);
     const gestures = bindChartGestures({
       host,
       chart,
@@ -621,6 +807,7 @@ export function useMarketChart(
     });
     session.current = {
       manager,
+      priceToCoordinate: (price) => series.priceToCoordinate(price),
       latest,
       toggleCrosshair,
       cancelGesture: gestures.cancel,
@@ -657,6 +844,7 @@ export function useMarketChart(
         setHasMore(more);
         updatePricePrecision(bars);
         setSeriesData();
+        syncTradeMarkers();
         const scale = chart.timeScale();
         const range =
           initialRange &&
@@ -698,9 +886,11 @@ export function useMarketChart(
       pendingHistory?.cancel();
       viewportIdle?.cancel();
       gestures.destroy();
+      resizeObserver.disconnect();
       clearTimeout(saveTimer);
       saveDrawings();
       session.current = null;
+      host.removeEventListener('pointerdown', beginTradeDrag, true);
       host.removeEventListener('pointerdown', middleDown, true);
       host.removeEventListener('pointerdown', startGesture, true);
       window.removeEventListener('pointerup', endGesture, true);
@@ -710,8 +900,11 @@ export function useMarketChart(
       host.removeEventListener('auxclick', preventAutoscroll);
       host.removeEventListener('wheel', navigateViewport, true);
       host.removeEventListener('pointermove', dragViewport, true);
-      host.removeEventListener('dblclick', navigateViewport, true);
+      host.removeEventListener('dblclick', doubleClick, true);
+      host.removeEventListener('contextmenu', contextMenu);
       manager.destroy();
+      unsubscribeTrading?.();
+      pane.detachPrimitive(tradeHistory);
       if (daySeparators) pane.detachPrimitive(daySeparators);
       chart.remove();
     };
@@ -723,6 +916,7 @@ export function useMarketChart(
     repository,
     revision,
     simulation,
+    trading,
   ]);
 
   return {
@@ -737,6 +931,14 @@ export function useMarketChart(
     measurement,
     loadedCount,
     hasMore,
+    coordinateRevision,
+    tradeHistoryLayout,
+    tradeMenu,
+    tradeError,
+    priceToCoordinate: (price: number) =>
+      session.current?.priceToCoordinate(price) ?? null,
+    closeTradeMenu,
+    clearTradeError,
     selectTool: (kind: DrawingKind | null) => {
       session.current?.cancelGesture();
       session.current?.manager.setTool(kind);

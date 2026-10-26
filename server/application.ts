@@ -159,10 +159,20 @@ export function createApplication(
             input.instrumentId === undefined
               ? undefined
               : text(input.instrumentId, 'инструмент');
+          const pointSize =
+            input.pointSize === undefined ? undefined : Number(input.pointSize);
+          if (
+            pointSize !== undefined &&
+            (!Number.isFinite(pointSize) || pointSize <= 0)
+          )
+            throw new HttpError(400, 'Размер пункта должен быть больше нуля.');
           const filePath = await sources.filePath(sourceId);
           server?.timeout(request, 0);
           return new Response(
-            imports.stream({ filePath, ticker, instrumentId }, request.signal),
+            imports.stream(
+              { filePath, ticker, instrumentId, pointSize },
+              request.signal,
+            ),
             {
               headers: {
                 'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -181,11 +191,16 @@ export function createApplication(
           });
         }
         if (request.method === 'PATCH' && instrument) {
-          store.renameInstrument(
-            instrument[1],
-            text((await body(request)).ticker, 'тикер'),
-          );
-          return json({ ok: true });
+          const input = await body(request);
+          const ticker = text(input.ticker, 'тикер');
+          if (input.pointSize === undefined) {
+            store.renameInstrument(instrument[1], ticker);
+            return json({ ok: true });
+          }
+          const pointSize = Number(input.pointSize);
+          if (!Number.isFinite(pointSize) || pointSize <= 0)
+            throw new HttpError(400, 'Размер пункта должен быть больше нуля.');
+          return json(store.updateInstrument(instrument[1], ticker, pointSize));
         }
         if (request.method === 'GET' && path === '/api/candles') {
           const datasetId = text(

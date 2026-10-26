@@ -1,10 +1,11 @@
-import { Play } from 'lucide-react';
+import { LoaderCircle, Play } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import type { Instrument } from '../domain/market';
 import {
   type SimulationSettings,
   validateSimulationSettings,
 } from '../domain/simulation';
+import { validateInitialBalance } from '../domain/trading';
 import {
   DateTimePicker,
   dateTimeTimestamp,
@@ -27,7 +28,10 @@ interface Props {
   open: boolean;
   instrument: Instrument;
   onOpenChange: (open: boolean) => void;
-  onStart: (settings: SimulationSettings) => void;
+  onStart: (
+    settings: SimulationSettings,
+    initialBalance: number,
+  ) => void | Promise<void>;
 }
 
 export function SimulationDialog({
@@ -40,7 +44,9 @@ export function SimulationDialog({
   const [end, setEnd] = useState(() => dateTimeValue(instrument.lastTime));
   const [toEnd, setToEnd] = useState(true);
   const [speed, setSpeed] = useState('1');
+  const [balance, setBalance] = useState('1000');
   const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -48,10 +54,11 @@ export function SimulationDialog({
     setEnd(dateTimeValue(instrument.lastTime));
     setToEnd(true);
     setSpeed('1');
+    setBalance('1000');
     setError(undefined);
   }, [open, instrument.firstTime, instrument.lastTime]);
 
-  function startSimulation(event: FormEvent<HTMLFormElement>) {
+  async function startSimulation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(undefined);
     const settings: SimulationSettings = {
@@ -61,17 +68,25 @@ export function SimulationDialog({
     };
     try {
       validateSimulationSettings(settings, instrument);
-      onStart(settings);
+      const initialBalance = Number(balance);
+      validateInitialBalance(initialBalance);
+      setBusy(true);
+      await onStart(settings, initialBalance);
       onOpenChange(false);
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Не удалось начать симуляцию.',
       );
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => !busy && onOpenChange(nextOpen)}
+    >
       <DialogContent className="simulation-dialog max-h-[calc(100dvh-2rem)] overflow-y-auto">
         <DialogHeader>
           <div className="dialog-symbol">
@@ -137,6 +152,23 @@ export function SimulationDialog({
               Например, 2 — вдвое быстрее, 10 — в десять раз быстрее.
             </p>
           </div>
+          <div className="form-field">
+            <Label htmlFor="simulation-initial-balance">
+              Баланс демосчёта, USD
+            </Label>
+            <Input
+              id="simulation-initial-balance"
+              type="number"
+              min="0"
+              step="any"
+              value={balance}
+              onChange={(event) => setBalance(event.target.value)}
+              required
+            />
+            <p className="simulation-help mt-1 text-xs text-muted-foreground">
+              Начальная сумма только для этой торговой сессии.
+            </p>
+          </div>
           {error && (
             <p className="form-error" role="alert">
               {error}
@@ -146,12 +178,18 @@ export function SimulationDialog({
             <Button
               type="button"
               variant="outline"
+              disabled={busy}
               onClick={() => onOpenChange(false)}
             >
               Отмена
             </Button>
-            <Button type="submit">
-              <Play size={15} /> Начать
+            <Button type="submit" disabled={busy}>
+              {busy ? (
+                <LoaderCircle size={15} className="animate-spin" />
+              ) : (
+                <Play size={15} />
+              )}
+              {busy ? 'Открываем сессию…' : 'Начать'}
             </Button>
           </DialogFooter>
         </form>

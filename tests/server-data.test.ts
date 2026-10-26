@@ -515,6 +515,7 @@ describe('local market data', () => {
     stores.splice(stores.indexOf(store), 1);
     const legacy = new Database(join(dataDir, 'market.sqlite'));
     legacy.run('ALTER TABLE instruments DROP COLUMN pricePrecision');
+    legacy.run('ALTER TABLE instruments DROP COLUMN pointSize');
     legacy.close();
     await rm(filePath);
 
@@ -532,12 +533,19 @@ describe('local market data', () => {
     ).toBe(3);
     db.run('UPDATE candles SET high = 12');
     expect(migrated.listInstruments()[0].pricePrecision).toBe(3);
+    expect(migrated.listInstruments()[0].pointSize).toBe(0.001);
+    const customPointSize = migrated.updateInstrument(
+      instrument.id,
+      instrument.ticker,
+      0.1,
+    );
+    expect(customPointSize.pointSize).toBe(0.1);
     db.close();
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
     const restarted = new LocalMarketStore({ dataDir });
     stores.push(restarted);
-    expect(restarted.listInstruments()).toEqual([instrument]);
+    expect(restarted.listInstruments()[0]).toMatchObject({ pointSize: 0.1 });
   });
 
   test('persists instruments and drawings across service restart', async () => {

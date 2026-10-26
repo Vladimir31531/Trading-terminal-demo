@@ -250,6 +250,11 @@ test('imports a disk source in a worker and serves metadata, pages and drawings'
     method: 'PATCH',
     body: JSON.stringify({ ticker: 'GOLD' }),
   });
+  const pointSizeResponse = await call(`/api/instruments/${instrument.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ ticker: 'GOLD', pointSize: 0.1 }),
+  });
+  expect(await pointSizeResponse.json()).toMatchObject({ pointSize: 0.1 });
   await call(`/api/drawings/${instrument.id}`, {
     method: 'PUT',
     body: JSON.stringify({ json: '[]' }),
@@ -259,6 +264,7 @@ test('imports a disk source in a worker and serves metadata, pages and drawings'
   });
   const items = (await (await call('/api/instruments')).json()) as Instrument[];
   expect(items[0].ticker).toBe('GOLD');
+  expect(items[0].pointSize).toBe(0.1);
   expect(await readFile(join(directory, 'sources/prices.csv'), 'utf8')).toBe(
     CSV,
   );
