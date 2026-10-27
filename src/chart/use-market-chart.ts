@@ -4,7 +4,6 @@ import {
   CrosshairMode,
   createChart,
   type LogicalRange,
-  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import {
@@ -32,6 +31,7 @@ import {
 } from './history-window';
 import { advanceReplayWindow } from './replay-window';
 import type { RulerMeasurement } from './ruler';
+import { createChartTimeFormatters } from './time-format';
 import { TradeHistory, type TradeHistoryLayout } from './trade-history';
 import {
   loadLatestHistory,
@@ -42,15 +42,6 @@ import {
 
 const VISIBLE_BARS = 110;
 const PAGE_SIZE = 800;
-const utcDate = new Intl.DateTimeFormat('ru-RU', {
-  timeZone: 'UTC',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-});
 
 interface ChartSession {
   manager: DrawingManager;
@@ -58,6 +49,7 @@ interface ChartSession {
   latest(): void;
   toggleCrosshair(): void;
   cancelGesture(): void;
+  setTimeZone(timeZone: string): void;
 }
 
 export function useMarketChart(
@@ -68,9 +60,12 @@ export function useMarketChart(
   trading?: TradingEngine,
   tradeVolume = 0.01,
   onEditTrade?: (order: TradeOrder) => void,
+  timeZone = 'UTC',
 ) {
   const container = useRef<HTMLDivElement>(null);
   const session = useRef<ChartSession | null>(null);
+  const displayTimeZone = useRef(timeZone);
+  displayTimeZone.current = timeZone;
   // Coarse candles must not overwrite the requested intraday dates on a round trip.
   const viewport = useRef<{
     instrumentId: string;
@@ -160,6 +155,8 @@ export function useMarketChart(
     let crosshairVisible = false;
     let saveTimer: ReturnType<typeof setTimeout> | undefined;
     const host = container.current;
+    let chartTimeZone = displayTimeZone.current;
+    const timeFormatters = createChartTimeFormatters(chartTimeZone);
     setLoading(true);
     setLoadingOlder(false);
     setError(undefined);
@@ -204,6 +201,7 @@ export function useMarketChart(
         rightOffset: 5,
         barSpacing: 9,
         shiftVisibleRangeOnNewBar: false,
+        tickMarkFormatter: timeFormatters.tickMarkFormatter,
       },
       crosshair: {
         mode: CrosshairMode.Hidden,
@@ -212,10 +210,7 @@ export function useMarketChart(
       },
       localization: {
         locale: 'ru-RU',
-        timeFormatter: (time: Time) =>
-          typeof time === 'number'
-            ? `${utcDate.format(time * 1000)} UTC`
-            : String(time),
+        timeFormatter: timeFormatters.timeFormatter,
       },
     });
     const series = chart.addSeries(CandlestickSeries, {
@@ -254,7 +249,7 @@ export function useMarketChart(
       magnet: 'off',
       stayInDrawingMode: false,
       timeInfo: () => ({
-        timeZone: 'UTC',
+        timeZone: chartTimeZone,
         intraday: !['1D', '1W', '1M'].includes(timeframe),
       }),
     });
@@ -306,7 +301,7 @@ export function useMarketChart(
         ...bar,
         time: bar.time as UTCTimestamp,
       }));
-      daySeparators?.setCandles(bars);
+      daySeparators?.setCandles(bars, chartTimeZone);
       series.setData(chartBars);
       setLoadedCount(bars.length);
     };
@@ -550,7 +545,7 @@ export function useMarketChart(
           else chartBars.push(next);
           series.update(next);
         }
-        daySeparators?.setCandles(bars);
+        daySeparators?.setCandles(bars, chartTimeZone);
         setLoadedCount(bars.length);
       }
       if (range) {
@@ -811,6 +806,17 @@ export function useMarketChart(
       latest,
       toggleCrosshair,
       cancelGesture: gestures.cancel,
+      setTimeZone: (nextTimeZone) => {
+        if (chartTimeZone === nextTimeZone) return;
+        chartTimeZone = nextTimeZone;
+        const formatters = createChartTimeFormatters(nextTimeZone);
+        chart.applyOptions({
+          localization: { timeFormatter: formatters.timeFormatter },
+          timeScale: { tickMarkFormatter: formatters.tickMarkFormatter },
+        });
+        daySeparators?.setCandles(bars, nextTimeZone);
+        manager.redraw();
+      },
     };
 
     void Promise.all([
@@ -918,6 +924,10 @@ export function useMarketChart(
     simulation,
     trading,
   ]);
+
+  useEffect(() => {
+    session.current?.setTimeZone(timeZone);
+  }, [timeZone]);
 
   return {
     container,

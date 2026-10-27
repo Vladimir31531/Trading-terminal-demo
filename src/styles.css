@@ -298,6 +298,31 @@ button:disabled {
   gap: 14px;
   min-width: 0;
 }
+.chart-header-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+.chart-time-zone {
+  max-width: 100%;
+}
+.chart-time-zone [data-slot="native-select-wrapper"] {
+  max-width: 100%;
+}
+.chart-time-zone [data-slot="native-select"] {
+  width: 210px;
+  max-width: 100%;
+  font-size: 11px;
+}
+.chart-time-zone-error {
+  display: block;
+  max-width: 250px;
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--destructive);
+}
 .simulation-dialog {
   width: 470px;
   max-width: calc(100% - 32px);

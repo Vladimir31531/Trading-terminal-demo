@@ -3,6 +3,7 @@ import type {
   IPanePrimitive,
   IPanePrimitivePaneView,
   IPrimitivePaneRenderer,
+  PaneAttachedParameter,
   UTCTimestamp,
 } from 'lightweight-charts';
 import { drawScene, type SceneItem } from 'lightweight-charts-drawing';
@@ -11,12 +12,41 @@ import type { Candle } from '../domain/market';
 
 export function dayBoundaryTimes(
   candles: readonly Pick<Candle, 'time'>[],
+  timeZone = 'UTC',
 ): UTCTimestamp[] {
   const times: UTCTimestamp[] = [];
-  let previousDay: number | undefined;
+  const formatter =
+    timeZone === 'UTC'
+      ? undefined
+      : new Intl.DateTimeFormat('en-CA', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hourCycle: 'h23',
+        });
+  let previousDay: string | number | undefined;
   for (const { time } of candles) {
-    const day = candleStart(time, '1D');
-    if (previousDay === undefined ? time === day : day !== previousDay)
+    let day: string | number;
+    let midnight: boolean;
+    if (formatter) {
+      const parts = formatter.formatToParts(time * 1000);
+      const value = (type: Intl.DateTimeFormatPartTypes) =>
+        parts.find((part) => part.type === type)?.value;
+      day = `${value('year')}-${value('month')}-${value('day')}`;
+      midnight =
+        time % 1 === 0 &&
+        value('hour') === '00' &&
+        value('minute') === '00' &&
+        value('second') === '00';
+    } else {
+      day = candleStart(time, '1D');
+      midnight = time === day;
+    }
+    if (previousDay === undefined ? midnight : day !== previousDay)
       times.push(time as UTCTimestamp);
     previousDay = day;
   }
@@ -26,6 +56,9 @@ export function dayBoundaryTimes(
 /** Background grid accents, independent of editable and persisted drawings. */
 export class DaySeparators implements IPanePrimitive {
   private times: UTCTimestamp[] = [];
+  private candleTimes: number[] = [];
+  private timeZone = 'UTC';
+  private requestUpdate?: () => void;
   private readonly views: IPanePrimitivePaneView[];
 
   constructor(chart: IChartApi) {
@@ -56,8 +89,27 @@ export class DaySeparators implements IPanePrimitive {
     this.views = [{ zOrder: () => 'normal', renderer: () => renderer }];
   }
 
-  setCandles(candles: readonly Pick<Candle, 'time'>[]): void {
-    this.times = dayBoundaryTimes(candles);
+  attached({ requestUpdate }: PaneAttachedParameter): void {
+    this.requestUpdate = requestUpdate;
+  }
+
+  detached(): void {
+    this.requestUpdate = undefined;
+  }
+
+  setCandles(candles: readonly Pick<Candle, 'time'>[], timeZone = 'UTC'): void {
+    // Replay updates OHLC repeatedly while the candle timestamps stay unchanged.
+    if (
+      this.timeZone === timeZone &&
+      candles.length === this.candleTimes.length &&
+      candles.every(({ time }, index) => time === this.candleTimes[index])
+    )
+      return;
+    const times = dayBoundaryTimes(candles, timeZone);
+    this.candleTimes = candles.map(({ time }) => time);
+    this.timeZone = timeZone;
+    this.times = times;
+    this.requestUpdate?.();
   }
 
   paneViews(): readonly IPanePrimitivePaneView[] {

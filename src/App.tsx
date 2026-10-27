@@ -14,6 +14,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { SimulationEngine } from './application/simulation-engine';
 import { TradingEngine } from './application/trading-engine';
+import { ChartTimeZoneSelect } from './components/ChartTimeZoneSelect';
 import { DeleteInstrumentDialog } from './components/DeleteInstrumentDialog';
 import { InstrumentDialog } from './components/InstrumentDialog';
 import { MarketChart } from './components/MarketChart';
@@ -25,6 +26,7 @@ import { Button } from './components/ui/button';
 import { type Instrument, TIMEFRAMES, type Timeframe } from './domain/market';
 import type { SimulationSettings } from './domain/simulation';
 import { type TradingSession, validateInitialBalance } from './domain/trading';
+import { loadChartTimeZone } from './infrastructure/chart-preferences';
 import { marketRepository } from './infrastructure/market-repository';
 import { tradingHistory } from './infrastructure/trading-history';
 import {
@@ -33,14 +35,7 @@ import {
 } from './infrastructure/trading-preferences';
 
 const numberFormat = new Intl.NumberFormat('ru-RU');
-const dateFormat = new Intl.DateTimeFormat('ru-RU', {
-  timeZone: 'UTC',
-  day: '2-digit',
-  month: '2-digit',
-  year: 'numeric',
-});
-
-function dateRange(instrument: Instrument) {
+function dateRange(instrument: Instrument, dateFormat: Intl.DateTimeFormat) {
   return `${dateFormat.format(instrument.firstTime * 1000)} — ${dateFormat.format(instrument.lastTime * 1000)}`;
 }
 
@@ -48,6 +43,17 @@ export default function App() {
   const [instruments, setInstruments] = useState<Instrument[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [timeframe, setTimeframe] = useState<Timeframe>('1m');
+  const [timeZone, setTimeZone] = useState(loadChartTimeZone);
+  const dateFormat = useMemo(
+    () =>
+      new Intl.DateTimeFormat('ru-RU', {
+        timeZone,
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+      }),
+    [timeZone],
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -375,20 +381,29 @@ export default function App() {
                     ))}
                 </div>
                 {selected ? (
-                  <fieldset className="timeframe-group" aria-label="Таймфрейм">
-                    {TIMEFRAMES.map((item) => (
-                      <Button
-                        key={item}
-                        variant="ghost"
-                        size="sm"
-                        aria-pressed={item === timeframe}
-                        className={`timeframe-button ${item === timeframe ? 'is-selected' : ''}`}
-                        onClick={() => setTimeframe(item)}
-                      >
-                        {item}
-                      </Button>
-                    ))}
-                  </fieldset>
+                  <div className="chart-header-tools">
+                    <fieldset
+                      className="timeframe-group"
+                      aria-label="Таймфрейм"
+                    >
+                      {TIMEFRAMES.map((item) => (
+                        <Button
+                          key={item}
+                          variant="ghost"
+                          size="sm"
+                          aria-pressed={item === timeframe}
+                          className={`timeframe-button ${item === timeframe ? 'is-selected' : ''}`}
+                          onClick={() => setTimeframe(item)}
+                        >
+                          {item}
+                        </Button>
+                      ))}
+                    </fieldset>
+                    <ChartTimeZoneSelect
+                      value={timeZone}
+                      onChange={setTimeZone}
+                    />
+                  </div>
                 ) : (
                   <span className="history-badge">
                     <span />
@@ -417,6 +432,7 @@ export default function App() {
                     key={`${selected.id}:${selected.datasetId}`}
                     instrument={selected}
                     timeframe={timeframe}
+                    timeZone={timeZone}
                     repository={marketRepository}
                     simulation={activeSimulation}
                     trading={activeTrading}
@@ -487,10 +503,12 @@ export default function App() {
                   </a>
                   {selected && (
                     <span className="footer-date-range">
-                      {dateRange(selected)}
+                      {dateRange(selected, dateFormat)}
                     </span>
                   )}
-                  <span className="utc-badge">UTC+0</span>
+                  <span className="utc-badge">
+                    {timeZone.replaceAll('_', ' ')}
+                  </span>
                 </div>
               </footer>
             </>

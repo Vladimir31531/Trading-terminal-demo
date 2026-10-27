@@ -42,6 +42,7 @@ const emptyTradingSnapshot: TradingSnapshot = {
 interface Props {
   instrument: Instrument;
   timeframe: Timeframe;
+  timeZone?: string;
   repository: MarketRepository;
   simulation?: SimulationEngine;
   trading?: TradingEngine;
@@ -51,6 +52,7 @@ interface Props {
 export function MarketChart({
   instrument,
   timeframe,
+  timeZone = 'UTC',
   repository,
   simulation,
   trading,
@@ -79,6 +81,7 @@ export function MarketChart({
     trading,
     tradeVolume,
     setEditingOrder,
+    timeZone,
   );
 
   useEffect(() => {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import type { UTCTimestamp } from 'lightweight-charts';
-import { dayBoundaryTimes } from '../src/chart/day-separators';
+import type { IChartApi, UTCTimestamp } from 'lightweight-charts';
+import { DaySeparators, dayBoundaryTimes } from '../src/chart/day-separators';
 
 const utc = (value: string): UTCTimestamp =>
   (Date.parse(value) / 1000) as UTCTimestamp;
@@ -83,5 +83,111 @@ describe('UTC day boundaries', () => {
       dayBoundaryTimes(history),
     );
     expect(history).toEqual(before);
+  });
+});
+
+describe('day boundaries in the selected time zone', () => {
+  test('uses New York midnight with its historical winter and summer offsets', () => {
+    const winter = bars(
+      '2026-01-20T04:59:00Z',
+      '2026-01-20T05:00:00Z',
+      '2026-01-20T05:01:00Z',
+    );
+    const summer = bars(
+      '2026-07-20T03:59:00Z',
+      '2026-07-20T04:00:00Z',
+      '2026-07-20T04:01:00Z',
+    );
+    expect(dayBoundaryTimes(winter, 'America/New_York')).toEqual([
+      utc('2026-01-20T05:00:00Z'),
+    ]);
+    expect(dayBoundaryTimes(summer, 'America/New_York')).toEqual([
+      utc('2026-07-20T04:00:00Z'),
+    ]);
+  });
+
+  test('supports the fractional offset in India and retains source timestamps', () => {
+    const history = bars(
+      '2026-10-20T18:29:00Z',
+      '2026-10-20T18:30:00Z',
+      '2026-10-20T18:31:00Z',
+    );
+    const before = structuredClone(history);
+    expect(dayBoundaryTimes(history, 'Asia/Kolkata')).toEqual([
+      utc('2026-10-20T18:30:00Z'),
+    ]);
+    expect(history).toEqual(before);
+    expect(dayBoundaryTimes(history, 'UTC')).toEqual([]);
+  });
+
+  test('marks the first candle only at exact local midnight', () => {
+    expect(
+      dayBoundaryTimes(bars('2026-10-20T18:30:00Z'), 'Asia/Kolkata'),
+    ).toEqual([utc('2026-10-20T18:30:00Z')]);
+    for (const date of [
+      '2026-10-20T18:30:00.001Z',
+      '2026-10-20T18:30:01Z',
+      '2026-10-20T18:31:00Z',
+    ])
+      expect(dayBoundaryTimes(bars(date), 'Asia/Kolkata')).toEqual([]);
+  });
+
+  test('keeps one boundary per local day through the Chisinau DST rollback', () => {
+    expect(
+      dayBoundaryTimes(
+        bars(
+          '2026-10-24T20:59:00Z',
+          '2026-10-24T21:00:00Z',
+          '2026-10-25T00:59:00Z',
+          '2026-10-25T01:00:00Z',
+          '2026-10-25T21:00:00Z',
+          '2026-10-25T21:59:00Z',
+          '2026-10-25T22:00:00Z',
+        ),
+        'Europe/Chisinau',
+      ),
+    ).toEqual([utc('2026-10-24T21:00:00Z'), utc('2026-10-25T22:00:00Z')]);
+  });
+
+  test('marks the first available local date transition after a gap', () => {
+    expect(
+      dayBoundaryTimes(
+        bars(
+          '2026-10-20T18:29:00Z',
+          '2026-10-20T18:45:00Z',
+          '2026-10-20T19:00:00Z',
+        ),
+        'Asia/Kolkata',
+      ),
+    ).toEqual([utc('2026-10-20T18:45:00Z')]);
+  });
+});
+
+describe('day separator updates', () => {
+  test('refreshes on a zone change, skips unchanged timestamps and stops updates after detach', () => {
+    const chart = {} as IChartApi;
+    const separators = new DaySeparators(chart);
+    let requested = 0;
+    separators.attached({ chart, requestUpdate: () => requested++ });
+    const history = bars('2026-10-20T18:29:00Z', '2026-10-20T18:30:00Z');
+    separators.setCandles(history, 'UTC');
+    expect(requested).toBe(1);
+    separators.setCandles(history, 'Asia/Kolkata');
+    expect(requested).toBe(2);
+    separators.setCandles(
+      history.map((candle) => ({ ...candle, close: 100 })),
+      'Asia/Kolkata',
+    );
+    expect(requested).toBe(2);
+
+    // The caller may reuse and update its existing candle array in place.
+    history[1] = { time: utc('2026-10-20T18:31:00Z') };
+    separators.setCandles(history, 'Asia/Kolkata');
+    expect(requested).toBe(3);
+    separators.setCandles(history.slice(1), 'Asia/Kolkata');
+    expect(requested).toBe(4);
+    separators.detached();
+    separators.setCandles(history, 'UTC');
+    expect(requested).toBe(4);
   });
 });

@@ -1,23 +1,23 @@
-import type { IChartApi, ISeriesApi } from 'lightweight-charts';
-import type { Coords, DrawingManager, Pt } from 'lightweight-charts-drawing';
-import { findDrawingAt, prepareDrawingCopy } from './drawing-copy';
-import type { RulerMeasurement } from './ruler';
+import type { IChartApi, ISeriesApi } from "lightweight-charts";
+import type { Coords, DrawingManager, Pt } from "lightweight-charts-drawing";
+import { findDrawingAt, prepareDrawingCopy } from "./drawing-copy";
+import type { RulerMeasurement } from "./ruler";
 
 interface GestureOptions {
   host: HTMLElement;
   chart: IChartApi;
-  series: ISeriesApi<'Candlestick'>;
+  series: ISeriesApi<"Candlestick">;
   manager: Pick<
     DrawingManager,
-    | 'drawings'
-    | 'drawingsVisible'
-    | 'selection'
-    | 'select'
-    | 'tool'
-    | 'setTool'
-    | 'add'
-    | 'update'
-    | 'remove'
+    | "drawings"
+    | "drawingsVisible"
+    | "selection"
+    | "select"
+    | "tool"
+    | "setTool"
+    | "add"
+    | "update"
+    | "remove"
   >;
   coords: Coords;
   ready(): boolean;
@@ -29,15 +29,15 @@ interface GestureOptions {
 export function bindChartGestures(options: GestureOptions) {
   const { host, chart, series, manager, coords } = options;
   const events = host.ownerDocument.defaultView;
-  if (!events) throw new Error('Окно графика недоступно.');
+  if (!events) throw new Error("Окно графика недоступно.");
   type Copy = NonNullable<ReturnType<typeof prepareDrawingCopy>>;
   interface Gesture {
     pointerId: number;
     origin: Pt;
     pane: { width: number; height: number };
     restore: Pick<
-      ReturnType<IChartApi['options']>,
-      'handleScroll' | 'handleScale'
+      ReturnType<IChartApi["options"]>,
+      "handleScroll" | "handleScale"
     >;
     selection: string[];
     copy?: Copy;
@@ -52,7 +52,7 @@ export function bindChartGestures(options: GestureOptions) {
       series.getPane().getHTMLElement()?.getBoundingClientRect().top ??
       bounds.top;
     return {
-      x: event.clientX - bounds.left - chart.priceScale('left').width(),
+      x: event.clientX - bounds.left - chart.priceScale("left").width(),
       y: event.clientY - paneTop,
     };
   };
@@ -154,7 +154,7 @@ export function bindChartGestures(options: GestureOptions) {
   };
   const cancel = () => finish(true);
   const key = (event: KeyboardEvent) => {
-    if (event.key === 'Escape' && gesture) {
+    if (event.key === "Escape" && gesture) {
       stop(event);
       cancel();
     }
@@ -162,28 +162,28 @@ export function bindChartGestures(options: GestureOptions) {
   const mouse = (event: MouseEvent) => {
     if (gesture && event.button === 0) stop(event);
   };
-  host.addEventListener('pointerdown', down, true);
-  host.addEventListener('mousedown', mouse, true);
-  host.addEventListener('lostpointercapture', cancelPointer);
-  events.addEventListener('pointermove', move, true);
-  events.addEventListener('pointerup', up, true);
-  events.addEventListener('pointercancel', cancelPointer, true);
-  events.addEventListener('blur', cancel);
-  events.addEventListener('keydown', key, true);
+  host.addEventListener("pointerdown", down, true);
+  host.addEventListener("mousedown", mouse, true);
+  host.addEventListener("lostpointercapture", cancelPointer);
+  events.addEventListener("pointermove", move, true);
+  events.addEventListener("pointerup", up, true);
+  events.addEventListener("pointercancel", cancelPointer, true);
+  events.addEventListener("blur", cancel);
+  events.addEventListener("keydown", key, true);
 
   return {
     active: () => !!gesture,
     cancel,
     destroy() {
       cancel();
-      host.removeEventListener('pointerdown', down, true);
-      host.removeEventListener('mousedown', mouse, true);
-      host.removeEventListener('lostpointercapture', cancelPointer);
-      events.removeEventListener('pointermove', move, true);
-      events.removeEventListener('pointerup', up, true);
-      events.removeEventListener('pointercancel', cancelPointer, true);
-      events.removeEventListener('blur', cancel);
-      events.removeEventListener('keydown', key, true);
+      host.removeEventListener("pointerdown", down, true);
+      host.removeEventListener("mousedown", mouse, true);
+      host.removeEventListener("lostpointercapture", cancelPointer);
+      events.removeEventListener("pointermove", move, true);
+      events.removeEventListener("pointerup", up, true);
+      events.removeEventListener("pointercancel", cancelPointer, true);
+      events.removeEventListener("blur", cancel);
+      events.removeEventListener("keydown", key, true);
     },
   };
 }
