@@ -1,5 +1,11 @@
 import { LoaderCircle, Pause, Play, Save, Square } from 'lucide-react';
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import type { SimulationEngine } from '../application/simulation-engine';
 import { validateSimulationSpeed } from '../domain/simulation';
 import { Button } from './ui/button';
@@ -34,13 +40,73 @@ export function SimulationControls({
   const state = useSyncExternalStore(subscribe, getSnapshot);
   const [speed, setSpeed] = useState(String(state.speed));
   const [speedError, setSpeedError] = useState<string>();
+  const originalSpeed = useRef<number | undefined>(undefined);
+  const restoreSpeed = useCallback(() => {
+    const previous = originalSpeed.current;
+    if (previous === undefined) return;
+    originalSpeed.current = undefined;
+    engine.setSpeed(previous);
+  }, [engine]);
 
   useEffect(() => {
     setSpeed(String(state.speed));
     setSpeedError(undefined);
   }, [state.speed]);
 
+  useEffect(() => {
+    if (busy) return;
+    const editing = (target: EventTarget | null) =>
+      target instanceof Element &&
+      target.closest(
+        'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="dialog"], [role="alertdialog"]',
+      );
+    const down = (event: KeyboardEvent) => {
+      const { status } = engine.getSnapshot();
+      if (
+        event.key !== 'ArrowRight' ||
+        event.defaultPrevented ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey ||
+        event.shiftKey ||
+        editing(event.target) ||
+        status === 'finished' ||
+        status === 'error'
+      )
+        return;
+      if (originalSpeed.current === undefined) {
+        if (event.repeat) return;
+        originalSpeed.current = engine.getSnapshot().speed;
+        engine.setSpeed(10_000);
+      }
+      event.preventDefault();
+    };
+    const up = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowRight') restoreSpeed();
+    };
+    const visibility = () => {
+      if (document.hidden) restoreSpeed();
+    };
+    const focus = (event: FocusEvent) => {
+      if (editing(event.target)) restoreSpeed();
+    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', restoreSpeed);
+    document.addEventListener('visibilitychange', visibility);
+    document.addEventListener('focusin', focus);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', restoreSpeed);
+      document.removeEventListener('visibilitychange', visibility);
+      document.removeEventListener('focusin', focus);
+      restoreSpeed();
+    };
+  }, [engine, busy, restoreSpeed]);
+
   function changeSpeed(value: string) {
+    restoreSpeed();
     setSpeed(value);
     try {
       const next = value.trim() ? Number(value) : Number.NaN;
@@ -69,7 +135,10 @@ export function SimulationControls({
         title="Остановить симуляцию"
         aria-label="Остановить симуляцию"
         disabled={busy}
-        onClick={onStop}
+        onClick={() => {
+          restoreSpeed();
+          onStop();
+        }}
       >
         <Square className="size-3.5" />
       </Button>
@@ -81,7 +150,10 @@ export function SimulationControls({
         title={busy ? 'Сохраняем…' : 'Сохранить и выйти'}
         aria-label={busy ? 'Сохраняем…' : 'Сохранить и выйти'}
         disabled={unavailable || busy}
-        onClick={onSuspend}
+        onClick={() => {
+          restoreSpeed();
+          onSuspend();
+        }}
       >
         {busy ? (
           <LoaderCircle className="size-3.5 animate-spin" />
@@ -116,12 +188,13 @@ export function SimulationControls({
         <Label className="simulation-speed-label flex items-center gap-1.5">
           <span className="sr-only">Скорость симуляции</span>
           <Input
-            className="simulation-speed h-8 w-20 px-2 text-xs tabular-nums"
+            className="simulation-speed h-8 w-24 px-2 text-xs tabular-nums"
             type="number"
             min="0"
             step="any"
             value={speed}
             aria-label="Скорость симуляции"
+            title="Удерживайте → вне полей ввода для ускорения до 10000×"
             aria-invalid={Boolean(speedError)}
             aria-describedby={speedError ? 'simulation-speed-error' : undefined}
             disabled={unavailable || busy}
