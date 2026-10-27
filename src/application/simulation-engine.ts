@@ -1,5 +1,6 @@
 import type { Candle } from '../domain/market';
 import {
+  type SimulationCheckpoint,
   type SimulationSettings,
   type SimulationSnapshot,
   validateSimulationSettings,
@@ -37,6 +38,7 @@ export class SimulationEngine {
   private hasMore = true;
   private fetching = false;
   private started = false;
+  private preparation?: Promise<void>;
   private delivered = false;
   private disposed = false;
   private wantsPlay = true;
@@ -67,6 +69,55 @@ export class SimulationEngine {
       document.addEventListener('visibilitychange', this.visibilityChanged);
   }
 
+  static restore(
+    datasetId: string,
+    settings: SimulationSettings,
+    source: Pick<MarketRepository, 'loadSeconds'>,
+    checkpoint: SimulationCheckpoint,
+    scheduler: SimulationScheduler = browserScheduler,
+  ): SimulationEngine {
+    validateSimulationSpeed(checkpoint.speed);
+    if (
+      !Number.isFinite(checkpoint.time) ||
+      checkpoint.time < settings.startTime ||
+      checkpoint.time > settings.endTime ||
+      typeof checkpoint.delivered !== 'boolean' ||
+      (!checkpoint.delivered && checkpoint.time !== settings.startTime) ||
+      !Number.isFinite(checkpoint.budget) ||
+      checkpoint.budget < 0
+    )
+      throw new Error('Некорректное сохранённое состояние симуляции.');
+    const simulation = new SimulationEngine(
+      datasetId,
+      settings,
+      source,
+      scheduler,
+    );
+    simulation.wantsPlay = false;
+    simulation.delivered = checkpoint.delivered;
+    simulation.budget = checkpoint.budget;
+    simulation.after = checkpoint.delivered ? checkpoint.time : undefined;
+    simulation.snapshot = {
+      status: 'paused',
+      time: checkpoint.time,
+      speed: checkpoint.speed,
+    };
+    return simulation;
+  }
+
+  exportCheckpoint(): SimulationCheckpoint {
+    if (this.ended())
+      throw new Error(
+        'Завершённую симуляцию нельзя сохранить для продолжения.',
+      );
+    return {
+      time: this.snapshot.time,
+      speed: this.snapshot.speed,
+      delivered: this.delivered,
+      budget: this.budget,
+    };
+  }
+
   getSnapshot = (): SimulationSnapshot => this.snapshot;
 
   subscribe = (listener: () => void): (() => void) => {
@@ -79,10 +130,12 @@ export class SimulationEngine {
     return () => this.candleListeners.delete(listener);
   }
 
-  start(): void {
-    if (this.disposed || this.started) return;
+  start(): Promise<void> {
+    if (this.started) return this.preparation ?? Promise.resolve();
+    if (this.disposed) return Promise.resolve();
     this.started = true;
-    this.fetchPage();
+    this.preparation = this.fetchPage();
+    return this.preparation;
   }
 
   play(): void {
@@ -260,7 +313,14 @@ export class SimulationEngine {
       this.delivered = true;
       this.deliver([this.page[this.index++]]);
     }
-    if (!this.remaining() && !this.hasMore && !this.fetching) {
+    if (
+      this.wantsPlay &&
+      !this.holds &&
+      !this.hidden &&
+      !this.remaining() &&
+      !this.hasMore &&
+      !this.fetching
+    ) {
       if (this.delivered) this.finish();
       else this.fail(new Error('В выбранном периоде нет секундных данных.'));
       return;
@@ -281,10 +341,11 @@ export class SimulationEngine {
       this.fetchPage();
   }
 
-  private fetchPage(): void {
-    if (this.ended() || this.fetching || !this.hasMore) return;
+  private fetchPage(): Promise<void> {
+    if (this.ended() || this.fetching || !this.hasMore)
+      return Promise.resolve();
     this.fetching = true;
-    void this.source
+    return this.source
       .loadSeconds(
         this.datasetId,
         this.settings.startTime,

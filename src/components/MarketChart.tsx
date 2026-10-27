@@ -10,8 +10,10 @@ import {
 } from 'lucide-react';
 import {
   Fragment,
+  type Ref,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useState,
   useSyncExternalStore,
 } from 'react';
@@ -40,6 +42,7 @@ const emptyTradingSnapshot: TradingSnapshot = {
 };
 
 interface Props {
+  ref?: Ref<MarketChartHandle>;
   instrument: Instrument;
   timeframe: Timeframe;
   timeZone?: string;
@@ -49,7 +52,12 @@ interface Props {
   tradeVolume?: number;
 }
 
+export interface MarketChartHandle {
+  exportDrawings(): string | undefined;
+}
+
 export function MarketChart({
+  ref,
   instrument,
   timeframe,
   timeZone = 'UTC',
@@ -83,6 +91,9 @@ export function MarketChart({
     setEditingOrder,
     timeZone,
   );
+  useImperativeHandle(ref, () => ({ exportDrawings: state.exportDrawings }), [
+    state.exportDrawings,
+  ]);
 
   useEffect(() => {
     if (!state.tradeMenu) return;

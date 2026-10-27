@@ -1,4 +1,5 @@
 import Dexie, { liveQuery, type Table } from 'dexie';
+import type { SavedSimulation } from '../domain/saved-simulation';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
@@ -10,6 +11,7 @@ class TradingDatabase extends Dexie {
   sessions!: Table<TradingSession, string>;
   trades!: Table<ClosedTrade, string>;
   balanceHistory!: Table<BalanceHistoryEntry, string>;
+  suspendedSimulations!: Table<SavedSimulation, string>;
 
   constructor() {
     super('terminal-demo-trading');
@@ -21,6 +23,12 @@ class TradingDatabase extends Dexie {
       sessions: 'id, instrumentId, startedAt, endedAt',
       trades: 'id, sessionId, [sessionId+openedAt], instrumentId',
       balanceHistory: 'id, sessionId, [sessionId+sequence]',
+    });
+    this.version(3).stores({
+      sessions: 'id, instrumentId, startedAt, endedAt',
+      trades: 'id, sessionId, [sessionId+openedAt], instrumentId',
+      balanceHistory: 'id, sessionId, [sessionId+sequence]',
+      suspendedSimulations: 'sessionId, savedAt',
     });
   }
 }
@@ -59,10 +67,81 @@ export const tradingHistory = {
   },
 
   async finishSession(sessionId: string, endedAt: number): Promise<void> {
-    await database.sessions.update(sessionId, {
-      endedAt: Date.now(),
-      simulationEndTime: endedAt / 1000,
-    });
+    await database.transaction(
+      'rw',
+      database.sessions,
+      database.suspendedSimulations,
+      async () => {
+        await database.sessions.update(sessionId, {
+          endedAt: Date.now(),
+          simulationEndTime: endedAt / 1000,
+        });
+        await database.suspendedSimulations.delete(sessionId);
+      },
+    );
+  },
+
+  async saveSimulation(saved: SavedSimulation): Promise<void> {
+    await database.transaction(
+      'rw',
+      database.sessions,
+      database.suspendedSimulations,
+      async () => {
+        const session = await database.sessions.get(saved.sessionId);
+        if (!session) throw new Error('Торговая сессия больше не существует.');
+        if (session.endedAt !== undefined)
+          throw new Error('Завершённую торговую сессию нельзя приостановить.');
+        if (
+          saved.trading.snapshot.sessionId !== session.id ||
+          saved.instrument.id !== session.instrumentId ||
+          saved.instrument.datasetId !== session.datasetId
+        ) {
+          throw new Error(
+            'Состояние симуляции не соответствует торговой сессии.',
+          );
+        }
+        await database.suspendedSimulations.put(saved);
+      },
+    );
+  },
+
+  async getSavedSimulation(
+    sessionId: string,
+  ): Promise<SavedSimulation | undefined> {
+    return database.suspendedSimulations.get(sessionId);
+  },
+
+  watchSavedSimulations(
+    onChange: (simulations: SavedSimulation[]) => void,
+    onError: (cause: unknown) => void,
+  ): () => void {
+    const subscription = liveQuery(() =>
+      database.suspendedSimulations.orderBy('savedAt').reverse().toArray(),
+    ).subscribe({ next: onChange, error: onError });
+    return () => subscription.unsubscribe();
+  },
+
+  async claimSavedSimulation(
+    sessionId: string,
+    savedAt: number,
+  ): Promise<void> {
+    await database.transaction(
+      'rw',
+      database.sessions,
+      database.suspendedSimulations,
+      async () => {
+        const saved = await database.suspendedSimulations.get(sessionId);
+        const session = await database.sessions.get(sessionId);
+        if (!saved || saved.savedAt !== savedAt) {
+          throw new Error(
+            'Симуляция уже продолжена или сохранена в другой вкладке. Обновите список.',
+          );
+        }
+        if (!session || session.endedAt !== undefined)
+          throw new Error('Торговая сессия уже завершена или удалена.');
+        await database.suspendedSimulations.delete(sessionId);
+      },
+    );
   },
 
   async saveClosedTrade(
@@ -148,12 +227,14 @@ export const tradingHistory = {
       database.sessions,
       database.trades,
       database.balanceHistory,
+      database.suspendedSimulations,
       async () => {
         await database.trades.where('sessionId').equals(sessionId).delete();
         await database.balanceHistory
           .where('sessionId')
           .equals(sessionId)
           .delete();
+        await database.suspendedSimulations.delete(sessionId);
         await database.sessions.delete(sessionId);
       },
     );

@@ -1,5 +1,6 @@
-import { ArrowLeft, LoaderCircle, Trash2 } from 'lucide-react';
+import { ArrowLeft, LoaderCircle, Play, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import type { SavedSimulation } from '../domain/saved-simulation';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
@@ -32,9 +33,18 @@ const moneyFormat = new Intl.NumberFormat('ru-RU', {
 interface Props {
   onBack: () => void;
   onBeforeDelete: (sessionId: string) => Promise<void>;
+  savedSimulations: readonly SavedSimulation[];
+  onResume: (sessionId: string) => Promise<void>;
+  resumeDisabled?: boolean;
 }
 
-export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
+export function TradingSessionsPage({
+  onBack,
+  onBeforeDelete,
+  savedSimulations,
+  onResume,
+  resumeDisabled = false,
+}: Props) {
   const [sessions, setSessions] = useState<TradingSessionSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [trades, setTrades] = useState<ClosedTrade[]>([]);
@@ -50,8 +60,13 @@ export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
   const [tradesError, setTradesError] = useState<string>();
   const [balanceError, setBalanceError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [resumingId, setResumingId] = useState<string>();
+  const [resumeError, setResumeError] = useState<string>();
   const selected = sessions.find((session) => session.id === selectedId);
   const detailError = error ?? tradesError ?? balanceError;
+  const savedBySession = new Map(
+    savedSimulations.map((saved) => [saved.sessionId, saved]),
+  );
 
   useEffect(() => {
     return tradingHistory.watchSessions(
@@ -142,6 +157,45 @@ export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
     }
   }
 
+  async function resumeSession(sessionId: string) {
+    if (busy || resumingId || resumeDisabled) return;
+    setResumingId(sessionId);
+    setResumeError(undefined);
+    try {
+      await onResume(sessionId);
+    } catch (cause) {
+      setResumeError(
+        cause instanceof Error
+          ? cause.message
+          : 'Не удалось продолжить сохранённую симуляцию.',
+      );
+    } finally {
+      setResumingId(undefined);
+    }
+  }
+
+  function resumeButton(session: TradingSessionSummary) {
+    if (session.endedAt !== undefined || !savedBySession.has(session.id))
+      return null;
+    return (
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={resumeDisabled || busy || Boolean(resumingId)}
+        aria-label={`Продолжить сессию ${session.ticker} от ${dateFormat.format(session.startedAt)}`}
+        onClick={() => void resumeSession(session.id)}
+      >
+        {resumingId === session.id ? (
+          <LoaderCircle className="size-3.5 animate-spin" />
+        ) : (
+          <Play className="size-3.5" />
+        )}
+        {resumingId === session.id ? 'Продолжаем…' : 'Продолжить'}
+      </Button>
+    );
+  }
+
   return (
     <div className={`sessions-page${selectedId ? ' session-detail-page' : ''}`}>
       <div
@@ -162,6 +216,7 @@ export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
           </p>
         </div>
         <div className="session-detail-actions">
+          {selected && resumeButton(selected)}
           {selectedId && (
             <Button
               variant="outline"
@@ -176,6 +231,11 @@ export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
           </Button>
         </div>
       </div>
+      {resumeError && (
+        <p className="form-error" role="alert">
+          {resumeError}
+        </p>
+      )}
       {!selectedId && error && (
         <p className="form-error" role="alert">
           {error}
@@ -249,52 +309,67 @@ export function TradingSessionsPage({ onBack, onBeforeDelete }: Props) {
               </tr>
             </thead>
             <tbody>
-              {sessions.map((session) => (
-                <tr key={session.id}>
-                  <td>
-                    <button
-                      type="button"
-                      className="session-open"
-                      onClick={() => openSession(session.id)}
+              {sessions.map((session) => {
+                const saved =
+                  session.endedAt === undefined
+                    ? savedBySession.get(session.id)
+                    : undefined;
+                return (
+                  <tr key={session.id}>
+                    <td>
+                      <button
+                        type="button"
+                        className="session-open"
+                        onClick={() => openSession(session.id)}
+                      >
+                        {session.ticker}
+                      </button>
+                    </td>
+                    <td>{dateFormat.format(session.startedAt)}</td>
+                    <td>
+                      {session.endedAt !== undefined
+                        ? dateFormat.format(session.endedAt)
+                        : saved
+                          ? 'Приостановлена'
+                          : 'Активна'}
+                      {saved && (
+                        <small className="block text-muted-foreground">
+                          {dateFormat.format(saved.replay.time * 1000)} UTC
+                        </small>
+                      )}
+                    </td>
+                    <td>{session.tradeCount}</td>
+                    <td>{formatBalance(session.initialBalance)}</td>
+                    <td>{formatBalance(session.balance)}</td>
+                    <td
+                      className={
+                        session.totalProfit >= 0
+                          ? 'trade-profit-positive'
+                          : 'trade-profit-negative'
+                      }
                     >
-                      {session.ticker}
-                    </button>
-                  </td>
-                  <td>{dateFormat.format(session.startedAt)}</td>
-                  <td>
-                    {session.endedAt
-                      ? dateFormat.format(session.endedAt)
-                      : 'Активна'}
-                  </td>
-                  <td>{session.tradeCount}</td>
-                  <td>{formatBalance(session.initialBalance)}</td>
-                  <td>{formatBalance(session.balance)}</td>
-                  <td
-                    className={
-                      session.totalProfit >= 0
-                        ? 'trade-profit-positive'
-                        : 'trade-profit-negative'
-                    }
-                  >
-                    {moneyFormat.format(session.totalProfit)}
-                  </td>
-                  <td>
-                    <Button
-                      type="button"
-                      size="icon-xs"
-                      variant="ghost"
-                      aria-label={`Удалить сессию ${session.ticker} от ${dateFormat.format(session.startedAt)}`}
-                      title="Удалить сессию"
-                      onClick={() => {
-                        setDeletionError(undefined);
-                        setDeleting(session);
-                      }}
-                    >
-                      <Trash2 size={14} />
-                    </Button>
-                  </td>
-                </tr>
-              ))}
+                      {moneyFormat.format(session.totalProfit)}
+                    </td>
+                    <td>
+                      {resumeButton(session)}
+                      <Button
+                        type="button"
+                        size="icon-xs"
+                        variant="ghost"
+                        aria-label={`Удалить сессию ${session.ticker} от ${dateFormat.format(session.startedAt)}`}
+                        title="Удалить сессию"
+                        disabled={busy || Boolean(resumingId)}
+                        onClick={() => {
+                          setDeletionError(undefined);
+                          setDeleting(session);
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

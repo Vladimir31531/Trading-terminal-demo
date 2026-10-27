@@ -84,6 +84,13 @@ export interface TradingSnapshot {
   finished: boolean;
 }
 
+export interface TradingCheckpoint {
+  snapshot: TradingSnapshot;
+  pointValuePer001: number;
+  nextTicket: number;
+  balanceSequence: number;
+}
+
 export interface TradeMarker {
   id: string;
   orderId: string;

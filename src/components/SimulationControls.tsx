@@ -1,4 +1,4 @@
-import { LoaderCircle, Pause, Play, Square } from 'lucide-react';
+import { LoaderCircle, Pause, Play, Save, Square } from 'lucide-react';
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import type { SimulationEngine } from '../application/simulation-engine';
 import { validateSimulationSpeed } from '../domain/simulation';
@@ -16,9 +16,16 @@ const utcTime = new Intl.DateTimeFormat('ru-RU', {
 interface Props {
   engine: SimulationEngine;
   onStop: () => void;
+  onSuspend: () => void;
+  busy?: boolean;
 }
 
-export function SimulationControls({ engine, onStop }: Props) {
+export function SimulationControls({
+  engine,
+  onStop,
+  onSuspend,
+  busy = false,
+}: Props) {
   const subscribe = useCallback(
     (listener: () => void) => engine.subscribe(listener),
     [engine],
@@ -56,12 +63,31 @@ export function SimulationControls({ engine, onStop }: Props) {
     <div className="simulation-controls flex min-w-0 flex-wrap items-center gap-2">
       <Button
         type="button"
-        size="sm"
+        size="icon-sm"
         variant="outline"
         className="simulation-stop"
+        title="Остановить симуляцию"
+        aria-label="Остановить симуляцию"
+        disabled={busy}
         onClick={onStop}
       >
-        <Square className="size-3" /> Остановить симуляцию
+        <Square className="size-3.5" />
+      </Button>
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="outline"
+        className="simulation-suspend"
+        title={busy ? 'Сохраняем…' : 'Сохранить и выйти'}
+        aria-label={busy ? 'Сохраняем…' : 'Сохранить и выйти'}
+        disabled={unavailable || busy}
+        onClick={onSuspend}
+      >
+        {busy ? (
+          <LoaderCircle className="size-3.5 animate-spin" />
+        ) : (
+          <Save className="size-3.5" />
+        )}
       </Button>
       <fieldset
         className="m-0 flex min-w-0 items-center gap-1.5 border-0 p-0"
@@ -72,7 +98,7 @@ export function SimulationControls({ engine, onStop }: Props) {
           size="icon-sm"
           variant="outline"
           className="simulation-play"
-          disabled={unavailable}
+          disabled={unavailable || busy}
           title={playing ? 'Приостановить симуляцию' : 'Продолжить симуляцию'}
           aria-label={
             playing ? 'Приостановить симуляцию' : 'Продолжить симуляцию'
@@ -98,7 +124,7 @@ export function SimulationControls({ engine, onStop }: Props) {
             aria-label="Скорость симуляции"
             aria-invalid={Boolean(speedError)}
             aria-describedby={speedError ? 'simulation-speed-error' : undefined}
-            disabled={state.status === 'finished' || state.status === 'error'}
+            disabled={unavailable || busy}
             onChange={(event) => changeSpeed(event.target.value)}
             onBlur={() => {
               if (speedError) {

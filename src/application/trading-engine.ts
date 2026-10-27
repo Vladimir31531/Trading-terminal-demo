@@ -9,6 +9,7 @@ import {
   type TradeOrder,
   type TradeProtection,
   type TradeSide,
+  type TradingCheckpoint,
   type TradingSession,
   type TradingSnapshot,
   validateInitialBalance,
@@ -59,6 +60,58 @@ export class TradingEngine {
     };
   }
 
+  static restore(
+    session: TradingSession,
+    instrument: Instrument,
+    history: TradingHistoryWriter,
+    checkpoint: TradingCheckpoint,
+  ): TradingEngine {
+    const { snapshot, pointValuePer001, nextTicket, balanceSequence } =
+      checkpoint;
+    if (
+      session.id !== snapshot.sessionId ||
+      session.instrumentId !== instrument.id ||
+      session.datasetId !== instrument.datasetId ||
+      snapshot.finished ||
+      !Number.isFinite(snapshot.currentTime) ||
+      !Number.isFinite(snapshot.balance) ||
+      !Number.isFinite(pointValuePer001) ||
+      pointValuePer001 <= 0 ||
+      !Number.isSafeInteger(nextTicket) ||
+      nextTicket < 1 ||
+      !Number.isSafeInteger(balanceSequence) ||
+      balanceSequence < 0 ||
+      snapshot.orders.some((order) => order.ticket >= nextTicket)
+    )
+      throw new Error('Некорректное сохранённое состояние торговой сессии.');
+    const trading = new TradingEngine(session, instrument, history);
+    trading.snapshot = structuredClone(snapshot);
+    trading.pointValuePer001 = pointValuePer001;
+    trading.ticket = nextTicket;
+    trading.balanceSequence = balanceSequence;
+    return trading;
+  }
+
+  async checkpoint(): Promise<TradingCheckpoint> {
+    this.assertActive();
+    await this.flushWrites();
+    if (this.snapshot.error) throw new Error(this.snapshot.error);
+    this.assertActive();
+    return {
+      snapshot: structuredClone(this.snapshot),
+      pointValuePer001: this.pointValuePer001,
+      nextTicket: this.ticket,
+      balanceSequence: this.balanceSequence,
+    };
+  }
+
+  detach(): void {
+    this.unsubscribeCandles?.();
+    this.unsubscribeSimulation?.();
+    this.unsubscribeCandles = undefined;
+    this.unsubscribeSimulation = undefined;
+  }
+
   getSnapshot = (): TradingSnapshot => this.snapshot;
 
   subscribe = (listener: () => void): (() => void) => {
@@ -67,8 +120,7 @@ export class TradingEngine {
   };
 
   connect(simulation: SimulationEngine): void {
-    this.unsubscribeCandles?.();
-    this.unsubscribeSimulation?.();
+    this.detach();
     this.unsubscribeCandles = simulation.onCandles(this.processCandles);
     this.unsubscribeSimulation = simulation.subscribe(() => {
       const status = simulation.getSnapshot().status;
@@ -229,8 +281,7 @@ export class TradingEngine {
   async finish(time = this.snapshot.currentTime): Promise<void> {
     if (this.closed) return this.flushWrites();
     this.closed = true;
-    this.unsubscribeCandles?.();
-    this.unsubscribeSimulation?.();
+    this.detach();
     const exitPrice = this.snapshot.currentPrice;
     for (const order of [...this.snapshot.orders]) {
       if (order.status === 'open' && exitPrice !== undefined)

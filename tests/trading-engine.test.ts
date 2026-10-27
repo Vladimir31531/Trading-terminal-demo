@@ -115,6 +115,9 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
     balanceEntries,
     candles,
     history,
+    instrument,
+    session,
+    source,
   };
 }
 
@@ -476,6 +479,170 @@ describe('trading calculations and replay execution', () => {
       phase: 'open',
       price: 100.5,
     });
+    simulation.destroy();
+  });
+
+  test('checkpoint flushes realized trades and restore keeps open orders, protection, markers and counters', async () => {
+    const {
+      frames,
+      simulation,
+      trading,
+      candles,
+      history,
+      session,
+      instrument,
+      source,
+      closedTrades,
+      balanceEntries,
+    } = createHarness();
+    let finishedSessions = 0;
+    history.finishSession = async () => {
+      finishedSessions++;
+    };
+    candles[1] = { time: 101, open: 100, high: 100.4, low: 100, close: 100.4 };
+    simulation.start();
+    await flush();
+    trading.openMarket('buy', 0.01);
+    frames.advance(1000);
+    simulation.pause();
+    trading.closeOrder(trading.getSnapshot().orders[0].id);
+    trading.openMarket('buy', 0.02);
+    const marketId = trading.getSnapshot().orders[0].id;
+    trading.editOrder(marketId, { stopLoss: 99, takeProfit: 102 });
+    trading.placeLimit('buy', 98, 0.03);
+    const limitId = trading.getSnapshot().orders[1].id;
+    trading.editOrder(limitId, { stopLoss: 97, takeProfit: 101 });
+
+    const checkpoint = await trading.checkpoint();
+    const replayCheckpoint = simulation.exportCheckpoint();
+    expect(closedTrades).toHaveLength(1);
+    expect(balanceEntries).toHaveLength(1);
+    expect(checkpoint).toMatchObject({
+      pointValuePer001: 5,
+      nextTicket: 4,
+      balanceSequence: 1,
+    });
+    expect(checkpoint.snapshot.balance).toBeCloseTo(1020);
+    expect(checkpoint.snapshot.orders).toHaveLength(2);
+    expect(checkpoint.snapshot.markers).toHaveLength(3);
+    trading.detach();
+    simulation.destroy();
+    expect(finishedSessions).toBe(0);
+    expect(trading.getSnapshot().finished).toBe(false);
+
+    const restored = TradingEngine.restore(
+      session,
+      instrument,
+      history,
+      checkpoint,
+    );
+    expect(restored.getSnapshot()).toEqual(checkpoint.snapshot);
+    expect(restored.getSnapshot()).not.toBe(checkpoint.snapshot);
+    expect(restored.getSnapshot().orders[0]).not.toBe(
+      checkpoint.snapshot.orders[0],
+    );
+    expect(restored.getSnapshot().markers[0]).not.toBe(
+      checkpoint.snapshot.markers[0],
+    );
+    checkpoint.snapshot.orders[0].stopLoss = 1;
+    checkpoint.snapshot.markers[0].price = 1;
+    expect(restored.getSnapshot().orders[0]).toMatchObject({
+      id: marketId,
+      stopLoss: 99,
+      takeProfit: 102,
+    });
+    expect(restored.getSnapshot().orders[1]).toMatchObject({
+      id: limitId,
+      status: 'pending',
+      stopLoss: 97,
+      takeProfit: 101,
+    });
+    expect(restored.getSnapshot().markers[0].price).toBe(100);
+
+    const resumedSimulation = SimulationEngine.restore(
+      instrument.datasetId,
+      simulation.settings,
+      source,
+      replayCheckpoint,
+      frames,
+    );
+    restored.connect(resumedSimulation);
+    resumedSimulation.start();
+    await flush();
+    expect(restored.getSnapshot().currentTime).toBe(101);
+    expect(restored.getSnapshot().orders).toHaveLength(2);
+    expect(closedTrades).toHaveLength(1);
+    restored.openMarket('sell', 0.01);
+    const newOrder = restored.getSnapshot().orders[2];
+    expect(newOrder.ticket).toBe(4);
+    restored.closeOrder(marketId);
+    restored.closeOrder(newOrder.id);
+    const nextCheckpoint = await restored.checkpoint();
+    expect(nextCheckpoint).toMatchObject({
+      pointValuePer001: 5,
+      nextTicket: 5,
+      balanceSequence: 3,
+    });
+    expect(closedTrades).toHaveLength(3);
+    expect(new Set(closedTrades.map((trade) => trade.id)).size).toBe(3);
+    expect(balanceEntries.map((entry) => entry.sequence)).toEqual([1, 2, 3]);
+    await restored.finish(101);
+    expect(finishedSessions).toBe(1);
+    expect(closedTrades).toHaveLength(3);
+    resumedSimulation.destroy();
+  });
+
+  test('detach removes replay listeners without closing positions or ending the session', async () => {
+    const { frames, simulation, trading, history, closedTrades } =
+      createHarness();
+    let finishedSessions = 0;
+    history.finishSession = async () => {
+      finishedSessions++;
+    };
+    simulation.start();
+    await flush();
+    trading.openMarket('buy', 0.01);
+    trading.detach();
+    frames.advance(2000);
+    await flush();
+    expect(simulation.getSnapshot().status).toBe('finished');
+    expect(trading.getSnapshot()).toMatchObject({
+      currentTime: 100,
+      finished: false,
+    });
+    expect(trading.getSnapshot().orders).toHaveLength(1);
+    expect(closedTrades).toHaveLength(0);
+    expect(finishedSessions).toBe(0);
+    simulation.destroy();
+  });
+
+  test('failed checkpoint retains unsaved history for retry without duplicate writes', async () => {
+    const { simulation, trading, history, closedTrades, balanceEntries } =
+      createHarness();
+    const save = history.saveClosedTrade;
+    let unavailable = true;
+    history.saveClosedTrade = async (trade, entry) => {
+      if (unavailable) throw new Error('Storage is unavailable.');
+      await save(trade, entry);
+    };
+    simulation.start();
+    await flush();
+    simulation.pause();
+    trading.openMarket('buy', 0.01);
+    trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await expect(trading.checkpoint()).rejects.toThrow(
+      'Storage is unavailable.',
+    );
+    expect(closedTrades).toHaveLength(0);
+    expect(trading.getSnapshot().finished).toBe(false);
+    unavailable = false;
+    const checkpoint = await trading.checkpoint();
+    await trading.checkpoint();
+    expect(checkpoint.balanceSequence).toBe(1);
+    expect(closedTrades).toHaveLength(1);
+    expect(balanceEntries.map((entry) => entry.sequence)).toEqual([1]);
+    expect(trading.getSnapshot().error).toBeUndefined();
+    trading.detach();
     simulation.destroy();
   });
 });

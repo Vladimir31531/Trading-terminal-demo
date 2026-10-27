@@ -49,6 +49,7 @@ interface ChartSession {
   latest(): void;
   toggleCrosshair(): void;
   cancelGesture(): void;
+  exportDrawings(): string | undefined;
   setTimeZone(timeZone: string): void;
 }
 
@@ -253,6 +254,10 @@ export function useMarketChart(
         intraday: !['1D', '1W', '1M'].includes(timeframe),
       }),
     });
+    const simulationEnded = () => {
+      const status = simulation?.getSnapshot().status;
+      return status === 'finished' || status === 'error';
+    };
     let tradeDrag:
       | {
           pointerId: number;
@@ -800,12 +805,29 @@ export function useMarketChart(
         if (!disposed) setMeasurement(next);
       },
     });
+    const clearFinishedSimulationDrawings = () => {
+      if (disposed || !initialized || !simulationEnded()) return;
+      gestures.cancel();
+      manager.setTool(null);
+      manager.clear();
+      clearTimeout(saveTimer);
+      setSelected(undefined);
+    };
+    const unsubscribeSimulation = simulation?.subscribe(
+      clearFinishedSimulationDrawings,
+    );
     session.current = {
       manager,
       priceToCoordinate: (price) => series.priceToCoordinate(price),
       latest,
       toggleCrosshair,
       cancelGesture: gestures.cancel,
+      exportDrawings: () => {
+        if (!initialized) return undefined;
+        gestures.cancel();
+        manager.setTool(null);
+        return manager.exportJSON();
+      },
       setTimeZone: (nextTimeZone) => {
         if (chartTimeZone === nextTimeZone) return;
         chartTimeZone = nextTimeZone;
@@ -870,8 +892,9 @@ export function useMarketChart(
         } else {
           showLatest();
         }
-        if (drawings) manager.importJSON(drawings);
+        if (drawings && !simulationEnded()) manager.importJSON(drawings);
         initialized = true;
+        clearFinishedSimulationDrawings();
         unsubscribeReplay = simulation?.onCandles(replay);
         setCandle(bars.at(-1));
         setLoading(false);
@@ -887,6 +910,7 @@ export function useMarketChart(
       if (initialized && viewportInteraction) rememberViewport();
       disposed = true;
       operation.abort();
+      unsubscribeSimulation?.();
       unsubscribeReplay?.();
       releaseBootstrap?.();
       pendingHistory?.cancel();
@@ -949,6 +973,7 @@ export function useMarketChart(
       session.current?.priceToCoordinate(price) ?? null,
     closeTradeMenu,
     clearTradeError,
+    exportDrawings: () => session.current?.exportDrawings(),
     selectTool: (kind: DrawingKind | null) => {
       session.current?.cancelGesture();
       session.current?.manager.setTool(kind);

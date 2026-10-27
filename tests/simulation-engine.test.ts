@@ -141,6 +141,32 @@ describe('simulation settings and replay aggregation', () => {
 });
 
 describe('simulation engine', () => {
+  test('awaiting restored preparation reports a read error without delivering candles', async () => {
+    const frames = new Frames();
+    const loading = deferred<HistoryPage>();
+    const restored = SimulationEngine.restore(
+      'dataset',
+      settings,
+      { loadSeconds: () => loading.promise },
+      { time: 101, speed: 1, delivered: true, budget: 0.5 },
+      frames,
+    );
+    const received: Candle[] = [];
+    restored.onCandles((candles) => received.push(...candles));
+    const preparation = restored.start();
+    expect(restored.start()).toBe(preparation);
+    loading.reject(new Error('Сервис истории недоступен.'));
+    await preparation;
+    expect(restored.getSnapshot()).toMatchObject({
+      status: 'error',
+      time: 101,
+      error: 'Сервис истории недоступен.',
+    });
+    expect(received).toEqual([]);
+    expect(frames.pending).toBe(0);
+    restored.destroy();
+  });
+
   test('delivers the first available second immediately, then batches elapsed ticks', async () => {
     const frames = new Frames();
     const data = source(
@@ -586,5 +612,141 @@ describe('simulation engine', () => {
       expect(() => engine.setSpeed(speed)).toThrow();
     expect(engine.getSnapshot().speed).toBe(1);
     engine.destroy();
+  });
+
+  test('restores paused at an exclusive cursor with the live speed and fractional progress', async () => {
+    const frames = new Frames();
+    const data = source([100, 101, 102, 103].map((time) => candle(time)));
+    const engine = new SimulationEngine(
+      'dataset',
+      settings,
+      data.repository,
+      frames,
+    );
+    engine.start();
+    await flush();
+    frames.advance(1500);
+    engine.pause();
+    engine.setSpeed(2);
+    const checkpoint = engine.exportCheckpoint();
+    expect(checkpoint).toEqual({
+      time: 101,
+      speed: 2,
+      delivered: true,
+      budget: 0.5,
+    });
+    engine.destroy();
+
+    const restoredFrames = new Frames();
+    restoredFrames.elapse(86_400_000);
+    const restored = SimulationEngine.restore(
+      'dataset',
+      settings,
+      data.repository,
+      checkpoint,
+      restoredFrames,
+    );
+    const received: number[] = [];
+    restored.onCandles((candles) =>
+      received.push(...candles.map((bar) => bar.time)),
+    );
+    expect(restored.getSnapshot()).toMatchObject({
+      status: 'paused',
+      time: 101,
+      speed: 2,
+    });
+    const requestsBeforeStart = data.requests.length;
+    expect(restoredFrames.pending).toBe(0);
+    restored.start();
+    await flush();
+    expect(data.requests[requestsBeforeStart].after).toBe(101);
+    expect(received).toEqual([]);
+    expect(restored.getSnapshot().status).toBe('paused');
+    restoredFrames.elapse(86_400_000);
+    restored.play();
+    restoredFrames.advance(249);
+    expect(received).toEqual([]);
+    restoredFrames.advance(1);
+    expect(received).toEqual([102]);
+    expect(restored.getSnapshot().time).toBe(102);
+    restored.destroy();
+  });
+
+  test('restoring before the first delivery retains the inclusive first candle until Play', async () => {
+    const frames = new Frames();
+    const data = source([100, 101].map((time) => candle(time)));
+    const engine = new SimulationEngine(
+      'dataset',
+      settings,
+      data.repository,
+      frames,
+    );
+    engine.pause();
+    const checkpoint = engine.exportCheckpoint();
+    expect(checkpoint).toMatchObject({
+      time: 100,
+      delivered: false,
+      budget: 0,
+    });
+    engine.destroy();
+
+    const restored = SimulationEngine.restore(
+      'dataset',
+      settings,
+      data.repository,
+      checkpoint,
+      frames,
+    );
+    const received: number[] = [];
+    restored.onCandles((candles) =>
+      received.push(...candles.map((bar) => bar.time)),
+    );
+    restored.start();
+    await flush();
+    expect(data.requests[0].after).toBeUndefined();
+    expect(received).toEqual([]);
+    restored.play();
+    expect(received).toEqual([100]);
+    restored.destroy();
+  });
+
+  test('an exhausted restored cursor stays paused until Play finishes it', async () => {
+    const frames = new Frames();
+    const data = source([candle(100), candle(101)]);
+    const engine = SimulationEngine.restore(
+      'dataset',
+      settings,
+      data.repository,
+      { time: 101, speed: 1, delivered: true, budget: 0 },
+      frames,
+    );
+    let delivered = 0;
+    engine.onCandles(() => delivered++);
+    engine.start();
+    await flush();
+    expect(engine.getSnapshot()).toMatchObject({ status: 'paused', time: 101 });
+    expect(delivered).toBe(0);
+    expect(frames.pending).toBe(0);
+    engine.play();
+    expect(engine.getSnapshot().status).toBe('finished');
+    expect(delivered).toBe(0);
+    engine.destroy();
+  });
+
+  test('cannot export completed or failed replay as a resumable checkpoint', async () => {
+    const frames = new Frames();
+    for (const candles of [[candle(100)], []]) {
+      const engine = new SimulationEngine(
+        'dataset',
+        settings,
+        source(candles).repository,
+        frames,
+      );
+      engine.start();
+      await flush();
+      expect(['finished', 'error']).toContain(engine.getSnapshot().status);
+      expect(() => engine.exportCheckpoint()).toThrow();
+      engine.destroy();
+    }
   });
 });

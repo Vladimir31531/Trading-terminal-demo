@@ -21,6 +21,13 @@ export interface SimulationSnapshot {
   error?: string;
 }
 
+export interface SimulationCheckpoint {
+  time: number;
+  speed: number;
+  delivered: boolean;
+  budget: number;
+}
+
 export function validateSimulationSpeed(speed: number): void {
   if (!Number.isFinite(speed) || speed <= 0)
     throw new Error('Скорость симуляции должна быть числом больше нуля.');

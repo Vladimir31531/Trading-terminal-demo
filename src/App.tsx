@@ -11,20 +11,25 @@ import {
   RefreshCw,
   Trash2,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SimulationEngine } from './application/simulation-engine';
+import { withSimulationDrawings } from './application/simulation-market-repository';
 import { TradingEngine } from './application/trading-engine';
 import { ChartTimeZoneSelect } from './components/ChartTimeZoneSelect';
 import { DeleteInstrumentDialog } from './components/DeleteInstrumentDialog';
 import { InstrumentDialog } from './components/InstrumentDialog';
-import { MarketChart } from './components/MarketChart';
+import { MarketChart, type MarketChartHandle } from './components/MarketChart';
 import { SimulationControls } from './components/SimulationControls';
 import { SimulationDialog } from './components/SimulationDialog';
 import { TradingControls } from './components/TradingControls';
 import { TradingSessionsPage } from './components/TradingSessionsPage';
 import { Button } from './components/ui/button';
 import { type Instrument, TIMEFRAMES, type Timeframe } from './domain/market';
-import type { SimulationSettings } from './domain/simulation';
+import type { SavedSimulation } from './domain/saved-simulation';
+import {
+  type SimulationSettings,
+  validateSimulationSettings,
+} from './domain/simulation';
 import { type TradingSession, validateInitialBalance } from './domain/trading';
 import { loadChartTimeZone } from './infrastructure/chart-preferences';
 import { marketRepository } from './infrastructure/market-repository';
@@ -62,6 +67,16 @@ export default function App() {
   const [simulationDialogOpen, setSimulationDialogOpen] = useState(false);
   const [simulation, setSimulation] = useState<SimulationEngine>();
   const [trading, setTrading] = useState<TradingEngine>();
+  const [simulationInstrument, setSimulationInstrument] =
+    useState<Instrument>();
+  const [drawingSeed, setDrawingSeed] = useState<string>();
+  const [savedSimulations, setSavedSimulations] = useState<SavedSimulation[]>(
+    [],
+  );
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [sessionError, setSessionError] = useState<string>();
+  const sessionOperation = useRef(false);
+  const chart = useRef<MarketChartHandle>(null);
   const [page, setPage] = useState<'chart' | 'sessions'>('chart');
   const [tradeVolume, setTradeVolume] = useState('0.01');
   const [pointValues, setPointValues] = useState<ReadonlyMap<string, string>>(
@@ -78,13 +93,38 @@ export default function App() {
   const activeSimulation =
     simulation?.datasetId === selected?.datasetId ? simulation : undefined;
   const activeTrading = activeSimulation ? trading : undefined;
+  const savedForInstrument = savedSimulations.find(
+    (saved) => saved.instrument.id === selectedId,
+  );
+  const chartRepository = useMemo(
+    () =>
+      activeSimulation
+        ? withSimulationDrawings(
+            marketRepository,
+            activeSimulation,
+            drawingSeed,
+          )
+        : marketRepository,
+    [activeSimulation, drawingSeed],
+  );
 
   useEffect(
     () => () => {
       simulation?.destroy();
-      void trading?.finish(simulation?.getSnapshot().time);
+      trading?.detach();
     },
     [simulation, trading],
+  );
+  useEffect(
+    () =>
+      tradingHistory.watchSavedSimulations(setSavedSimulations, (cause) => {
+        setSessionError(
+          cause instanceof Error
+            ? cause.message
+            : 'Не удалось прочитать сохранённые симуляции.',
+        );
+      }),
+    [],
   );
   useEffect(() => {
     if (simulation && simulation.datasetId !== selected?.datasetId) {
@@ -131,6 +171,9 @@ export default function App() {
     }
     nextTrading.connect(next);
     simulation?.destroy();
+    setSessionError(undefined);
+    setDrawingSeed(undefined);
+    setSimulationInstrument(selected);
     setTrading(nextTrading);
     setSimulation(next);
     next.start();
@@ -143,12 +186,137 @@ export default function App() {
   }
 
   async function stopSimulation() {
+    if (sessionOperation.current) return;
     simulation?.pause();
     await trading?.finish(simulation?.getSnapshot().time);
     if (trading?.getSnapshot().error) return;
     simulation?.destroy();
     setSimulation(undefined);
     setTrading(undefined);
+  }
+
+  async function suspendSimulation() {
+    if (
+      !simulation ||
+      !trading ||
+      !simulationInstrument ||
+      sessionOperation.current
+    )
+      return;
+    sessionOperation.current = true;
+    setSessionBusy(true);
+    setSessionError(undefined);
+    simulation.pause();
+    try {
+      const replay = simulation.exportCheckpoint();
+      const drawings =
+        chart.current?.exportDrawings() ??
+        (await chartRepository.loadDrawings(simulationInstrument.id));
+      const tradingState = await trading.checkpoint();
+      await tradingHistory.saveSimulation({
+        sessionId: tradingState.snapshot.sessionId,
+        instrument: simulationInstrument,
+        settings: { ...simulation.settings },
+        replay,
+        trading: tradingState,
+        timeframe,
+        tradeVolume,
+        drawings,
+        savedAt: Date.now(),
+      });
+      trading.detach();
+      simulation.destroy();
+      setSimulation(undefined);
+      setTrading(undefined);
+    } catch (cause) {
+      setSessionError(
+        cause instanceof Error
+          ? cause.message
+          : 'Не удалось сохранить симуляцию. Она остаётся на паузе.',
+      );
+    } finally {
+      sessionOperation.current = false;
+      setSessionBusy(false);
+    }
+  }
+
+  async function resumeSimulation(sessionId: string): Promise<void> {
+    if (sessionOperation.current || simulation)
+      throw new Error('Сначала сохраните или остановите текущую симуляцию.');
+    sessionOperation.current = true;
+    setSessionBusy(true);
+    setSessionError(undefined);
+    let next: SimulationEngine | undefined;
+    try {
+      const [saved, session, items] = await Promise.all([
+        tradingHistory.getSavedSimulation(sessionId),
+        tradingHistory.getSession(sessionId),
+        marketRepository.listInstruments(),
+      ]);
+      if (!saved || !session || session.endedAt)
+        throw new Error('Сохранённая симуляция больше не доступна.');
+      const instrument = items.find((item) => item.id === saved.instrument.id);
+      if (!instrument || instrument.datasetId !== saved.instrument.datasetId)
+        throw new Error(
+          'Не удалось продолжить симуляцию: инструмент удалён или его CSV был заменён.',
+        );
+      validateSimulationSettings(saved.settings, instrument);
+      if (saved.trading.snapshot.currentTime !== saved.replay.time)
+        throw new Error(
+          'Сохранённые время симуляции и состояние торговли не совпадают.',
+        );
+      next = SimulationEngine.restore(
+        instrument.datasetId,
+        saved.settings,
+        marketRepository,
+        saved.replay,
+      );
+      const nextTrading = TradingEngine.restore(
+        session,
+        saved.instrument,
+        tradingHistory,
+        saved.trading,
+      );
+      // Prepare the actual replay page before consuming the saved state.
+      await next.start();
+      if (next.getSnapshot().status === 'error')
+        throw new Error(
+          next.getSnapshot().error ?? 'Не удалось прочитать CSV.',
+        );
+      await tradingHistory.claimSavedSimulation(sessionId, saved.savedAt);
+      nextTrading.connect(next);
+      setInstruments(items);
+      setSelectedId(instrument.id);
+      setTimeframe(saved.timeframe);
+      setTradeVolume(saved.tradeVolume);
+      setPointValues((current) =>
+        new Map(current).set(
+          instrument.id,
+          String(saved.trading.pointValuePer001),
+        ),
+      );
+      setDrawingSeed(saved.drawings);
+      setSimulationInstrument(saved.instrument);
+      setTrading(nextTrading);
+      setSimulation(next);
+      setPage('chart');
+    } catch (cause) {
+      next?.destroy();
+      throw cause;
+    } finally {
+      sessionOperation.current = false;
+      setSessionBusy(false);
+    }
+  }
+
+  function resumeFromHeader(sessionId: string) {
+    void resumeSimulation(sessionId).catch((cause: unknown) => {
+      setSessionError(
+        cause instanceof Error
+          ? cause.message
+          : 'Не удалось продолжить симуляцию.',
+      );
+    });
   }
 
   async function stopSessionBeforeDelete(sessionId: string): Promise<void> {
@@ -229,7 +397,7 @@ export default function App() {
 
   return (
     <div className="terminal-app">
-      <div className="workspace">
+      <div className="workspace" inert={sessionBusy} aria-busy={sessionBusy}>
         <aside className="sidebar" aria-label="Инструменты">
           <a
             className="brand sidebar-brand"
@@ -342,6 +510,9 @@ export default function App() {
             <TradingSessionsPage
               onBack={() => setPage('chart')}
               onBeforeDelete={stopSessionBeforeDelete}
+              savedSimulations={savedSimulations}
+              onResume={resumeSimulation}
+              resumeDisabled={Boolean(simulation) || sessionBusy}
             />
           ) : (
             <>
@@ -356,7 +527,9 @@ export default function App() {
                       <>
                         <SimulationControls
                           engine={activeSimulation}
-                          onStop={stopSimulation}
+                          onStop={() => void stopSimulation()}
+                          onSuspend={() => void suspendSimulation()}
+                          busy={sessionBusy}
                         />
                         {activeTrading && (
                           <TradingControls
@@ -369,15 +542,30 @@ export default function App() {
                         )}
                       </>
                     ) : (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        className="simulation-start"
-                        onClick={() => setSimulationDialogOpen(true)}
-                      >
-                        <Play className="size-3.5" /> Начать симуляцию
-                      </Button>
+                      <>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="simulation-start"
+                          onClick={() => setSimulationDialogOpen(true)}
+                        >
+                          <Play className="size-3.5" /> Начать симуляцию
+                        </Button>
+                        {savedForInstrument && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              resumeFromHeader(savedForInstrument.sessionId)
+                            }
+                            disabled={sessionBusy}
+                          >
+                            <Play className="size-3.5" /> Продолжить сохранённую
+                          </Button>
+                        )}
+                      </>
                     ))}
                 </div>
                 {selected ? (
@@ -411,6 +599,11 @@ export default function App() {
                   </span>
                 )}
               </div>
+              {sessionError && (
+                <p className="form-error mx-4 my-2" role="alert">
+                  {sessionError}
+                </p>
+              )}
               <div className="chart-content">
                 {loading ? (
                   <div className="center-state">
@@ -429,11 +622,12 @@ export default function App() {
                   </div>
                 ) : selected ? (
                   <MarketChart
+                    ref={chart}
                     key={`${selected.id}:${selected.datasetId}`}
                     instrument={selected}
                     timeframe={timeframe}
                     timeZone={timeZone}
-                    repository={marketRepository}
+                    repository={chartRepository}
                     simulation={activeSimulation}
                     trading={activeTrading}
                     tradeVolume={Number(tradeVolume)}
