@@ -24,6 +24,7 @@ import { SimulationDialog } from './components/SimulationDialog';
 import { TradingControls } from './components/TradingControls';
 import { TradingSessionsPage } from './components/TradingSessionsPage';
 import { Button } from './components/ui/button';
+import { useSimulationShortcuts } from './components/use-simulation-shortcuts';
 import { type Instrument, TIMEFRAMES, type Timeframe } from './domain/market';
 import type { SavedSimulation } from './domain/saved-simulation';
 import {
@@ -93,6 +94,7 @@ export default function App() {
   const activeSimulation =
     simulation?.datasetId === selected?.datasetId ? simulation : undefined;
   const activeTrading = activeSimulation ? trading : undefined;
+  const restoreSpeed = useSimulationShortcuts(activeSimulation, sessionBusy);
   const savedForInstrument = savedSimulations.find(
     (saved) => saved.instrument.id === selectedId,
   );
@@ -527,6 +529,7 @@ export default function App() {
                       <>
                         <SimulationControls
                           engine={activeSimulation}
+                          restoreSpeed={restoreSpeed}
                           onStop={() => void stopSimulation()}
                           onSuspend={() => void suspendSimulation()}
                           busy={sessionBusy}

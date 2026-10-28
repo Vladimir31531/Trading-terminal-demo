@@ -1,5 +1,9 @@
-import { describe, expect, test } from 'bun:test';
-import type { IChartApi, UTCTimestamp } from 'lightweight-charts';
+import { describe, expect, spyOn, test } from 'bun:test';
+import type {
+  IChartApi,
+  IPrimitivePaneRenderer,
+  UTCTimestamp,
+} from 'lightweight-charts';
 import { DaySeparators, dayBoundaryTimes } from '../src/chart/day-separators';
 
 const utc = (value: string): UTCTimestamp =>
@@ -164,6 +168,92 @@ describe('day boundaries in the selected time zone', () => {
 });
 
 describe('day separator updates', () => {
+  test('formats only added timestamps and discards dates outside the current chart window', () => {
+    const format = spyOn(Intl.DateTimeFormat.prototype, 'formatToParts');
+    try {
+      const separators = new DaySeparators({} as IChartApi);
+      const start = utc('2026-10-20T00:00:00Z');
+      let history = Array.from({ length: 3200 }, (_, index) => ({
+        time: start + index * 60,
+      }));
+      separators.setCandles(history, 'Europe/Chisinau');
+      expect(format).toHaveBeenCalledTimes(3200);
+      for (let index = 0; index < 40; index++) {
+        history = [...history.slice(1), { time: start + (3200 + index) * 60 }];
+        separators.setCandles(history, 'Europe/Chisinau');
+      }
+      expect(format).toHaveBeenCalledTimes(3240);
+      separators.setCandles(
+        history.map((bar) => ({ ...bar, close: 200 })),
+        'Europe/Chisinau',
+      );
+      expect(format).toHaveBeenCalledTimes(3240);
+
+      // A timestamp that left the chart must be formatted again when revisited.
+      history = [{ time: start }, ...history.slice(0, -1)];
+      separators.setCandles(history, 'Europe/Chisinau');
+      expect(format).toHaveBeenCalledTimes(3241);
+      history[0] = { time: start + 1 };
+      separators.setCandles(history, 'Europe/Chisinau');
+      expect(format).toHaveBeenCalledTimes(3242);
+      separators.setCandles(history, 'America/New_York');
+      expect(format).toHaveBeenCalledTimes(6442);
+      separators.setCandles(history, 'UTC');
+      expect(format).toHaveBeenCalledTimes(6442);
+      separators.setCandles([], 'Europe/Chisinau');
+      separators.setCandles(history, 'Europe/Chisinau');
+      expect(format).toHaveBeenCalledTimes(9642);
+    } finally {
+      format.mockRestore();
+    }
+  });
+
+  test('cached boundaries match a fresh calculation through gaps, trimming, DST and zone changes', () => {
+    const positioned: UTCTimestamp[] = [];
+    const chart = {
+      timeScale: () => ({
+        timeToCoordinate: (time: UTCTimestamp) => {
+          positioned.push(time);
+          return null;
+        },
+      }),
+      options: () => ({ layout: { fontFamily: 'sans-serif' } }),
+    } as unknown as IChartApi;
+    const separators = new DaySeparators(chart);
+    const renderer = separators.paneViews()[0].renderer();
+    const target = {
+      useMediaCoordinateSpace: (paint: (scope: unknown) => void) =>
+        paint({ context: {}, mediaSize: { width: 100, height: 100 } }),
+    } as Parameters<NonNullable<IPrimitivePaneRenderer['drawBackground']>>[0];
+    const history = bars(
+      '2026-10-24T20:59:00Z',
+      '2026-10-24T21:00:00Z',
+      '2026-10-25T00:59:00Z',
+      '2026-10-25T01:00:00Z',
+      '2026-10-25T21:00:00Z',
+      '2026-10-25T22:00:00Z',
+      '2026-10-26T23:00:00Z',
+    );
+    for (const zone of [
+      'Europe/Chisinau',
+      'Asia/Kolkata',
+      'UTC',
+      'Europe/Chisinau',
+    ]) {
+      for (const window of [
+        history.slice(0, 3),
+        history,
+        history.slice(2),
+        history.slice(5),
+      ]) {
+        separators.setCandles(window, zone);
+        positioned.length = 0;
+        renderer?.drawBackground?.(target);
+        expect(positioned).toEqual(dayBoundaryTimes(window, zone));
+      }
+    }
+  });
+
   test('refreshes on a zone change, skips unchanged timestamps and stops updates after detach', () => {
     const chart = {} as IChartApi;
     const separators = new DaySeparators(chart);

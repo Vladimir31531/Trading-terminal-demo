@@ -21,18 +21,26 @@ interface Props {
 
 export function TradeEditDialog({ engine, order, onOpenChange }: Props) {
   const [price, setPrice] = useState('');
+  const [volume, setVolume] = useState('');
   const [stopLoss, setStopLoss] = useState('');
   const [takeProfit, setTakeProfit] = useState('');
   const [error, setError] = useState<string>();
+  const {
+    id,
+    price: entryPrice,
+    volume: orderVolume,
+    status,
+    stopLoss: orderStopLoss,
+    takeProfit: orderTakeProfit,
+  } = order ?? {};
 
   useEffect(() => {
-    setPrice(order ? String(order.price) : '');
-    setStopLoss(order?.stopLoss === undefined ? '' : String(order.stopLoss));
-    setTakeProfit(
-      order?.takeProfit === undefined ? '' : String(order.takeProfit),
-    );
+    setPrice(id ? String(entryPrice) : '');
+    setVolume(status ? String(orderVolume) : '');
+    setStopLoss(orderStopLoss === undefined ? '' : String(orderStopLoss));
+    setTakeProfit(orderTakeProfit === undefined ? '' : String(orderTakeProfit));
     setError(undefined);
-  }, [order]);
+  }, [id, entryPrice, orderVolume, status, orderStopLoss, orderTakeProfit]);
 
   function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -43,6 +51,7 @@ export function TradeEditDialog({ engine, order, onOpenChange }: Props) {
       const target = takeProfit.trim() ? Number(takeProfit) : undefined;
       engine.editOrder(order.id, {
         price: priceValue,
+        ...(order.status === 'pending' ? { volume: Number(volume) } : {}),
         stopLoss: stop,
         takeProfit: target,
       });
@@ -63,10 +72,24 @@ export function TradeEditDialog({ engine, order, onOpenChange }: Props) {
             {order?.kind === 'limit' ? 'limit' : 'market'} #{order?.ticket}
           </DialogTitle>
           <DialogDescription>
-            Настройте цену входа, стоп-лосс и тейк-профит.
+            Настройте лот, цену входа, стоп-лосс и тейк-профит. Лот можно
+            изменить только до открытия сделки.
           </DialogDescription>
         </DialogHeader>
         <form className="trade-edit-form" onSubmit={save}>
+          <div className="form-field">
+            <Label htmlFor="trade-order-volume">Лот</Label>
+            <Input
+              id="trade-order-volume"
+              type="number"
+              min="0"
+              step="any"
+              value={volume}
+              onChange={(event) => setVolume(event.target.value)}
+              disabled={order?.status === 'open'}
+              required
+            />
+          </div>
           <div className="form-field">
             <Label htmlFor="trade-entry-price">Цена</Label>
             <Input

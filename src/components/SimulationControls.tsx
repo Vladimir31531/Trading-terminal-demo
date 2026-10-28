@@ -1,11 +1,5 @@
 import { LoaderCircle, Pause, Play, Save, Square } from 'lucide-react';
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import type { SimulationEngine } from '../application/simulation-engine';
 import { validateSimulationSpeed } from '../domain/simulation';
 import { Button } from './ui/button';
@@ -23,6 +17,7 @@ interface Props {
   engine: SimulationEngine;
   onStop: () => void;
   onSuspend: () => void;
+  restoreSpeed: () => void;
   busy?: boolean;
 }
 
@@ -30,6 +25,7 @@ export function SimulationControls({
   engine,
   onStop,
   onSuspend,
+  restoreSpeed,
   busy = false,
 }: Props) {
   const subscribe = useCallback(
@@ -40,70 +36,11 @@ export function SimulationControls({
   const state = useSyncExternalStore(subscribe, getSnapshot);
   const [speed, setSpeed] = useState(String(state.speed));
   const [speedError, setSpeedError] = useState<string>();
-  const originalSpeed = useRef<number | undefined>(undefined);
-  const restoreSpeed = useCallback(() => {
-    const previous = originalSpeed.current;
-    if (previous === undefined) return;
-    originalSpeed.current = undefined;
-    engine.setSpeed(previous);
-  }, [engine]);
 
   useEffect(() => {
     setSpeed(String(state.speed));
     setSpeedError(undefined);
   }, [state.speed]);
-
-  useEffect(() => {
-    if (busy) return;
-    const editing = (target: EventTarget | null) =>
-      target instanceof Element &&
-      target.closest(
-        'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="dialog"], [role="alertdialog"]',
-      );
-    const down = (event: KeyboardEvent) => {
-      const { status } = engine.getSnapshot();
-      if (
-        event.key !== 'ArrowRight' ||
-        event.defaultPrevented ||
-        event.ctrlKey ||
-        event.altKey ||
-        event.metaKey ||
-        event.shiftKey ||
-        editing(event.target) ||
-        status === 'finished' ||
-        status === 'error'
-      )
-        return;
-      if (originalSpeed.current === undefined) {
-        if (event.repeat) return;
-        originalSpeed.current = engine.getSnapshot().speed;
-        engine.setSpeed(10_000);
-      }
-      event.preventDefault();
-    };
-    const up = (event: KeyboardEvent) => {
-      if (event.key === 'ArrowRight') restoreSpeed();
-    };
-    const visibility = () => {
-      if (document.hidden) restoreSpeed();
-    };
-    const focus = (event: FocusEvent) => {
-      if (editing(event.target)) restoreSpeed();
-    };
-    window.addEventListener('keydown', down);
-    window.addEventListener('keyup', up);
-    window.addEventListener('blur', restoreSpeed);
-    document.addEventListener('visibilitychange', visibility);
-    document.addEventListener('focusin', focus);
-    return () => {
-      window.removeEventListener('keydown', down);
-      window.removeEventListener('keyup', up);
-      window.removeEventListener('blur', restoreSpeed);
-      document.removeEventListener('visibilitychange', visibility);
-      document.removeEventListener('focusin', focus);
-      restoreSpeed();
-    };
-  }, [engine, busy, restoreSpeed]);
 
   function changeSpeed(value: string) {
     restoreSpeed();
@@ -171,7 +108,12 @@ export function SimulationControls({
           variant="outline"
           className="simulation-play"
           disabled={unavailable || busy}
-          title={playing ? 'Приостановить симуляцию' : 'Продолжить симуляцию'}
+          title={
+            playing
+              ? 'Приостановить симуляцию · Пробел'
+              : 'Продолжить симуляцию · Пробел'
+          }
+          aria-keyshortcuts="Space"
           aria-label={
             playing ? 'Приостановить симуляцию' : 'Продолжить симуляцию'
           }

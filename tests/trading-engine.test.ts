@@ -122,6 +122,87 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
 }
 
 describe('trading calculations and replay execution', () => {
+  test('keeps trade markers unchanged across thousands of idle seconds and appends executions immutably', async () => {
+    const { simulation, trading, session, instrument, history } =
+      createHarness();
+    await simulation.start();
+    simulation.pause();
+    trading.openMarket('buy', 0.01);
+    trading.closeOrder(trading.getSnapshot().orders[0].id);
+    const checkpoint = await trading.checkpoint();
+    trading.detach();
+    simulation.destroy();
+
+    const frames = new Frames();
+    const source = {
+      async loadSeconds(
+        _dataset: string,
+        from: number,
+        through: number,
+        after?: number,
+        limit = 800,
+      ) {
+        const start = after === undefined ? from : after + 1;
+        const count = Math.min(limit, through - start + 1);
+        return {
+          candles: Array.from({ length: count }, (_, index) => ({
+            time: start + index,
+            open: 100,
+            high: 100,
+            low: 99,
+            close: 100,
+          })),
+          hasMore: start + count <= through,
+          hasNewer: false,
+        };
+      },
+    };
+    const replay = SimulationEngine.restore(
+      instrument.datasetId,
+      { startTime: 100, endTime: 10_000, speed: 10_000 },
+      source,
+      { time: 100, speed: 10_000, delivered: true, budget: 0 },
+      frames,
+    );
+    const restored = TradingEngine.restore(
+      session,
+      instrument,
+      history,
+      checkpoint,
+    );
+    restored.connect(replay);
+    await replay.start();
+    replay.play();
+    const before = restored.getSnapshot();
+    const markers = before.markers;
+    for (let batch = 0; batch < 4; batch++) {
+      frames.advance(80);
+      await flush();
+      expect(restored.getSnapshot().markers).toBe(markers);
+    }
+    expect(restored.getSnapshot().currentTime).toBeGreaterThan(3000);
+    restored.placeLimit('buy', 99.5, 0.02);
+    frames.advance(80);
+    await flush();
+    const openedMarkers = restored.getSnapshot().markers;
+    expect(openedMarkers).not.toBe(markers);
+    expect(openedMarkers).toHaveLength(markers.length + 1);
+    expect(openedMarkers.slice(0, -1)).toEqual(checkpoint.snapshot.markers);
+    expect(openedMarkers.at(-1)).toMatchObject({ phase: 'open', price: 99.5 });
+    expect(before.markers).toBe(markers);
+    expect(markers).toEqual(checkpoint.snapshot.markers);
+    frames.advance(80);
+    await flush();
+    expect(restored.getSnapshot().markers).toBe(openedMarkers);
+    restored.closeOrder(restored.getSnapshot().orders[0].id);
+    expect(restored.getSnapshot().markers).not.toBe(openedMarkers);
+    expect(restored.getSnapshot().markers.at(-1)?.phase).toBe('close');
+    expect(openedMarkers).toHaveLength(3);
+    await restored.checkpoint();
+    restored.detach();
+    replay.destroy();
+  });
+
   test('calculates signed profit in points and scales by lot size', () => {
     expect(calculateProfit('buy', 100, 100.7, 0.1, 5, 0.02)).toBeCloseTo(70);
     expect(calculateProfit('sell', 100, 100.7, 0.1, 5, 0.01)).toBeCloseTo(-35);
@@ -457,6 +538,132 @@ describe('trading calculations and replay execution', () => {
       stopLoss: undefined,
       takeProfit: 97,
     });
+    simulation.destroy();
+  });
+
+  test('changes a pending order volume without changing entry or protection', async () => {
+    const { simulation, trading } = createHarness();
+    simulation.start();
+    await flush();
+    trading.placeLimit('buy', 99.5, 0.01);
+    const order = trading.getSnapshot().orders[0];
+    trading.editOrder(order.id, { stopLoss: 98, takeProfit: 102 });
+
+    trading.editOrder(order.id, { volume: 0.04 });
+
+    expect(trading.getSnapshot().orders[0]).toMatchObject({
+      id: order.id,
+      status: 'pending',
+      price: 99.5,
+      volume: 0.04,
+      stopLoss: 98,
+      takeProfit: 102,
+      profit: 0,
+    });
+    expect(trading.getSnapshot().markers).toHaveLength(0);
+    expect(trading.getSnapshot().balance).toBe(1000);
+    simulation.destroy();
+  });
+
+  test('fills an edited volume and uses it for open profit and closed history', async () => {
+    const { simulation, trading, frames, closedTrades } = createHarness();
+    simulation.start();
+    await flush();
+    trading.placeLimit('buy', 99.5, 0.01);
+    const order = trading.getSnapshot().orders[0];
+    trading.editOrder(order.id, { volume: 0.03 });
+
+    frames.advance(1000);
+
+    expect(trading.getSnapshot().orders[0]).toMatchObject({
+      status: 'open',
+      volume: 0.03,
+      price: 99.5,
+    });
+    expect(trading.getSnapshot().orders[0].profit).toBeCloseTo(75);
+    trading.closeOrder(order.id);
+    await flush();
+    expect(closedTrades).toHaveLength(1);
+    expect(closedTrades[0].volume).toBe(0.03);
+    expect(closedTrades[0].profit).toBeCloseTo(75);
+    expect(trading.getSnapshot().balance).toBeCloseTo(1075);
+    simulation.destroy();
+  });
+
+  test('uses the new volume when an entry edit fills a limit immediately', async () => {
+    const { simulation, trading } = createHarness();
+    simulation.start();
+    await flush();
+    trading.placeLimit('buy', 99, 0.01);
+    const order = trading.getSnapshot().orders[0];
+
+    trading.editOrder(order.id, { price: 100.5, volume: 0.03 });
+
+    expect(trading.getSnapshot().orders[0]).toMatchObject({
+      status: 'open',
+      price: 100.5,
+      volume: 0.03,
+    });
+    expect(trading.getSnapshot().orders[0].profit).toBeCloseTo(-75);
+    simulation.destroy();
+  });
+
+  test.each([0, -0.01, Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects invalid edited volume %s before changing any order field',
+    async (volume) => {
+      const { simulation, trading } = createHarness();
+      simulation.start();
+      await flush();
+      trading.placeLimit('buy', 99, 0.01);
+      const original = trading.getSnapshot();
+      const order = structuredClone(original.orders[0]);
+
+      expect(() =>
+        trading.editOrder(order.id, {
+          volume,
+          price: 98,
+          stopLoss: 97,
+          takeProfit: 101,
+        }),
+      ).toThrow('Объём должен быть числом больше нуля.');
+
+      expect(trading.getSnapshot()).toBe(original);
+      expect(trading.getSnapshot().orders[0]).toEqual(order);
+      simulation.destroy();
+    },
+  );
+
+  test('blocks changing an open volume while allowing protection edits with its unchanged volume', async () => {
+    const { simulation, trading } = createHarness();
+    simulation.start();
+    await flush();
+    trading.openMarket('buy', 0.01);
+    const original = trading.getSnapshot();
+    const order = structuredClone(original.orders[0]);
+
+    expect(() =>
+      trading.editOrder(order.id, {
+        volume: 0.02,
+        stopLoss: 99,
+        takeProfit: 101,
+      }),
+    ).toThrow('Нельзя изменить объём уже открытой сделки.');
+    expect(trading.getSnapshot()).toBe(original);
+    expect(trading.getSnapshot().orders[0]).toEqual(order);
+
+    trading.editOrder(order.id, {
+      volume: 0.01,
+      stopLoss: 99,
+      takeProfit: 101,
+    });
+    expect(trading.getSnapshot().orders[0]).toMatchObject({
+      status: 'open',
+      volume: 0.01,
+      stopLoss: 99,
+      takeProfit: 101,
+    });
+    trading.setProtection(order.id, 'takeProfit', 102);
+    expect(trading.getSnapshot().orders[0].takeProfit).toBe(102);
     simulation.destroy();
   });
 

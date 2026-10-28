@@ -30,12 +30,26 @@ export function mergeHistoryWindow(
   page: Candle[],
   direction: HistoryDirection,
   visibleRange?: { from: number; to: number } | null,
+  evictionBatchSize = 1,
 ) {
   const combined =
     direction === 'older' ? [...page, ...current] : [...current, ...page];
   const overflow = Math.max(0, combined.length - MAX_CACHED_CANDLES);
-  const removedLeft = direction === 'newer' ? overflow : 0;
-  const removedRight = direction === 'older' ? overflow : 0;
+  const outsideViewport = !visibleRange
+    ? combined.length
+    : direction === 'newer'
+      ? Math.max(0, Math.floor(visibleRange.from))
+      : Math.max(0, current.length - 1 - Math.ceil(visibleRange.to));
+  // Leave room for live appends without evicting any visible candle.
+  const removed = Math.max(
+    overflow,
+    Math.min(
+      Math.ceil(overflow / evictionBatchSize) * evictionBatchSize,
+      outsideViewport,
+    ),
+  );
+  const removedLeft = direction === 'newer' ? removed : 0;
+  const removedRight = direction === 'older' ? removed : 0;
   return {
     candles: combined.slice(removedLeft, combined.length - removedRight),
     // Applying this offset to both logical range endpoints retains their times.

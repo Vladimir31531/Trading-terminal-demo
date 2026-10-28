@@ -396,7 +396,9 @@ export function MarketChart({
       {trading && (
         <TradeEditDialog
           engine={trading}
-          order={editingOrder}
+          order={tradingState.orders.find(
+            (order) => order.id === editingOrder?.id,
+          )}
           onOpenChange={(open) => !open && setEditingOrder(undefined)}
         />
       )}

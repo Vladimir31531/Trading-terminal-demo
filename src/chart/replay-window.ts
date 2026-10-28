@@ -2,6 +2,8 @@ import type { Candle, Timeframe } from '../domain/market';
 import { aggregateReplayCandle } from '../domain/simulation';
 import { mergeHistoryWindow } from './history-window';
 
+const EVICTION_BATCH_SIZE = 800;
+
 /** Advance live candles while retaining a bounded historical viewport. */
 export function advanceReplayWindow(
   candles: Candle[],
@@ -28,7 +30,13 @@ export function advanceReplayWindow(
     ? [...candles.slice(0, -1), replacement]
     : candles;
   const appended = changes.filter((bar) => bar.time > lastTime);
-  const window = mergeHistoryWindow(current, appended, 'newer', range);
+  const window = mergeHistoryWindow(
+    current,
+    appended,
+    'newer',
+    range,
+    EVICTION_BATCH_SIZE,
+  );
   if (!window.preservesViewport || (interacting && window.removedLeft > 0))
     return { candles, forming, changes: [], hasNewer: true, removedLeft: 0 };
   return {

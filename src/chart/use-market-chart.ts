@@ -247,6 +247,7 @@ export function useMarketChart(
       : undefined;
     if (daySeparators) pane.attachPrimitive(daySeparators);
     const manager = new DrawingManager(chart, series, {
+      bars: () => chartBars,
       magnet: 'off',
       stayInDrawingMode: false,
       timeInfo: () => ({

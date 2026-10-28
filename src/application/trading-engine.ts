@@ -211,9 +211,16 @@ export class TradingEngine {
     this.publish();
   }
 
-  editOrder(id: string, changes: { price?: number } & ProtectionLevels): void {
+  editOrder(
+    id: string,
+    changes: { price?: number; volume?: number } & ProtectionLevels,
+  ): void {
     this.assertActive();
     const order = this.requireOrder(id);
+    const volume = changes.volume ?? order.volume;
+    validateVolume(volume);
+    if (order.status === 'open' && volume !== order.volume)
+      throw new Error('Нельзя изменить объём уже открытой сделки.');
     const price = changes.price ?? order.price;
     validatePrice(price, 'Цена ордера');
     const shift = order.status === 'pending' ? price - order.price : 0;
@@ -238,6 +245,7 @@ export class TradingEngine {
         ? {
             ...item,
             price,
+            volume,
             stopLoss: protection.stopLoss,
             takeProfit: protection.takeProfit,
           }
@@ -358,7 +366,8 @@ export class TradingEngine {
         ),
       };
     });
-    this.snapshot.markers = [...this.snapshot.markers, ...markers];
+    if (markers.length)
+      this.snapshot.markers = [...this.snapshot.markers, ...markers];
     return filled;
   }
 

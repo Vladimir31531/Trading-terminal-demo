@@ -93,10 +93,58 @@ describe('live replay chart window', () => {
       false,
       { from: 3090, to: 3205 },
     );
-    expect(result.candles).toHaveLength(MAX_CACHED_CANDLES);
-    expect(result.removedLeft).toBe(1);
-    expect(result.candles[3089].time).toBe(candles[3090].time);
+    expect(result.candles.length).toBeLessThan(MAX_CACHED_CANDLES);
+    expect(result.removedLeft).toBeGreaterThan(1);
+    expect(result.candles[3090 - result.removedLeft].time).toBe(
+      candles[3090].time,
+    );
     expect(result.candles.at(-1)).toEqual(bar(next, 101));
+  });
+
+  test('a month of fast replay retains a bounded cache with infrequent full chart resets', () => {
+    let candles = history();
+    let forming = candles.at(-1);
+    let resets = 0;
+    const firstNewTime = MAX_CACHED_CANDLES * 60;
+    const minutes = 30 * 24 * 60;
+    for (let minute = 0; minute < minutes; minute += 13) {
+      const count = Math.min(13, minutes - minute);
+      const seconds = Array.from({ length: count }, (_, index) =>
+        bar(firstNewTime + (minute + index) * 60),
+      );
+      const result = advanceReplayWindow(
+        candles,
+        forming,
+        seconds,
+        '1m',
+        false,
+        { from: candles.length - 110, to: candles.length + 5 },
+      );
+      candles = result.candles;
+      forming = result.forming;
+      if (result.removedLeft) resets++;
+      expect(candles.length).toBeLessThanOrEqual(MAX_CACHED_CANDLES);
+      expect(candles.at(-1)?.time).toBe(seconds.at(-1)?.time);
+      expect(result.hasNewer).toBe(false);
+    }
+    expect(resets).toBeLessThan(100);
+    expect(candles.at(-1)?.time).toBe(firstNewTime + (minutes - 1) * 60);
+  });
+
+  test('batched eviction shrinks to the available offscreen space near the oldest visible candle', () => {
+    const candles = history();
+    const result = advanceReplayWindow(
+      candles,
+      candles.at(-1),
+      [bar(MAX_CACHED_CANDLES * 60)],
+      '1m',
+      false,
+      { from: 4.5, to: 100 },
+    );
+    expect(result.removedLeft).toBe(4);
+    expect(result.candles[0]).toBe(candles[4]);
+    expect(result.candles[100 - result.removedLeft]).toBe(candles[100]);
+    expect(result.hasNewer).toBe(false);
   });
 
   test('a visible oldest candle is not evicted to display an offscreen new price', () => {

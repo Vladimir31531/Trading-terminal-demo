@@ -10,42 +10,52 @@ import { drawScene, type SceneItem } from 'lightweight-charts-drawing';
 import { candleStart } from '../domain/aggregation';
 import type { Candle } from '../domain/market';
 
-export function dayBoundaryTimes(
+interface CandleDay {
+  day: string | number;
+  midnight: boolean;
+}
+
+function dayFormatter(timeZone: string): Intl.DateTimeFormat | undefined {
+  return timeZone === 'UTC'
+    ? undefined
+    : new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23',
+      });
+}
+
+function candleDay(time: number, formatter?: Intl.DateTimeFormat): CandleDay {
+  if (!formatter) {
+    const day = candleStart(time, '1D');
+    return { day, midnight: time === day };
+  }
+  const parts = formatter.formatToParts(time * 1000);
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value;
+  return {
+    day: `${value('year')}-${value('month')}-${value('day')}`,
+    midnight:
+      time % 1 === 0 &&
+      value('hour') === '00' &&
+      value('minute') === '00' &&
+      value('second') === '00',
+  };
+}
+
+function collectDayBoundaries(
   candles: readonly Pick<Candle, 'time'>[],
-  timeZone = 'UTC',
+  classify: (time: number) => CandleDay,
 ): UTCTimestamp[] {
   const times: UTCTimestamp[] = [];
-  const formatter =
-    timeZone === 'UTC'
-      ? undefined
-      : new Intl.DateTimeFormat('en-CA', {
-          timeZone,
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hourCycle: 'h23',
-        });
   let previousDay: string | number | undefined;
   for (const { time } of candles) {
-    let day: string | number;
-    let midnight: boolean;
-    if (formatter) {
-      const parts = formatter.formatToParts(time * 1000);
-      const value = (type: Intl.DateTimeFormatPartTypes) =>
-        parts.find((part) => part.type === type)?.value;
-      day = `${value('year')}-${value('month')}-${value('day')}`;
-      midnight =
-        time % 1 === 0 &&
-        value('hour') === '00' &&
-        value('minute') === '00' &&
-        value('second') === '00';
-    } else {
-      day = candleStart(time, '1D');
-      midnight = time === day;
-    }
+    const { day, midnight } = classify(time);
     if (previousDay === undefined ? midnight : day !== previousDay)
       times.push(time as UTCTimestamp);
     previousDay = day;
@@ -53,10 +63,20 @@ export function dayBoundaryTimes(
   return times;
 }
 
+export function dayBoundaryTimes(
+  candles: readonly Pick<Candle, 'time'>[],
+  timeZone = 'UTC',
+): UTCTimestamp[] {
+  const formatter = dayFormatter(timeZone);
+  return collectDayBoundaries(candles, (time) => candleDay(time, formatter));
+}
+
 /** Background grid accents, independent of editable and persisted drawings. */
 export class DaySeparators implements IPanePrimitive {
   private times: UTCTimestamp[] = [];
   private candleTimes: number[] = [];
+  private candleDays = new Map<number, CandleDay>();
+  private formatter?: Intl.DateTimeFormat;
   private timeZone = 'UTC';
   private requestUpdate?: () => void;
   private readonly views: IPanePrimitivePaneView[];
@@ -105,8 +125,21 @@ export class DaySeparators implements IPanePrimitive {
       candles.every(({ time }, index) => time === this.candleTimes[index])
     )
       return;
-    const times = dayBoundaryTimes(candles, timeZone);
-    this.candleTimes = candles.map(({ time }) => time);
+    const sameZone = this.timeZone === timeZone;
+    const formatter = sameZone ? this.formatter : dayFormatter(timeZone);
+    const previousDays = sameZone ? this.candleDays : undefined;
+    const nextDays = new Map<number, CandleDay>();
+    const candleTimes: number[] = [];
+    const times = collectDayBoundaries(candles, (time) => {
+      const day = previousDays?.get(time) ?? candleDay(time, formatter);
+      nextDays.set(time, day);
+      candleTimes.push(time);
+      return day;
+    });
+    // Retain only the chart's current window; evicted session history is not cached.
+    this.candleTimes = candleTimes;
+    this.candleDays = nextDays;
+    this.formatter = formatter;
     this.timeZone = timeZone;
     this.times = times;
     this.requestUpdate?.();
