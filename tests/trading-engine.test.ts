@@ -6,6 +6,7 @@ import type { Instrument } from '../src/domain/market';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
+  PendingTradeReview,
   TradingSession,
 } from '../src/domain/trading';
 import { calculateProfit, validateProtection } from '../src/domain/trading';
@@ -37,6 +38,14 @@ class Frames implements SimulationScheduler {
 const flush = async () => {
   for (let index = 0; index < 5; index++) await Promise.resolve();
 };
+
+async function approveReviews(trading: TradingEngine): Promise<void> {
+  let review = trading.getSnapshot().pendingTradeReviews?.[0];
+  while (review) {
+    await trading.saveTradeReview(review.trade.id, {});
+    review = trading.getSnapshot().pendingTradeReviews?.[0];
+  }
+}
 
 function createHarness(initialBalance = 1000, sessionId = 'session-1') {
   const candles = [
@@ -91,10 +100,19 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
   };
   const closedTrades: ClosedTrade[] = [];
   const balanceEntries: BalanceHistoryEntry[] = [];
+  const stagedReviews: PendingTradeReview[] = [];
   const history = {
+    async stageClosedTrade(review: PendingTradeReview) {
+      if (!stagedReviews.some((item) => item.trade.id === review.trade.id))
+        stagedReviews.push(review);
+    },
     async saveClosedTrade(trade: ClosedTrade, entry: BalanceHistoryEntry) {
       closedTrades.push(trade);
       balanceEntries.push(entry);
+      const reviewIndex = stagedReviews.findIndex(
+        (item) => item.trade.id === trade.id,
+      );
+      if (reviewIndex !== -1) stagedReviews.splice(reviewIndex, 1);
     },
     async finishSession() {},
   };
@@ -113,6 +131,7 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
     trading,
     closedTrades,
     balanceEntries,
+    stagedReviews,
     candles,
     history,
     instrument,
@@ -122,6 +141,141 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
 }
 
 describe('trading calculations and replay execution', () => {
+  test('pauses a manual close and stages its execution without recording history before review', async () => {
+    const {
+      simulation,
+      trading,
+      frames,
+      closedTrades,
+      balanceEntries,
+      stagedReviews,
+    } = createHarness();
+    await simulation.start();
+    trading.openMarket('buy', 0.02);
+    const order = trading.getSnapshot().orders[0];
+    trading.closeOrder(order.id);
+    await flush();
+
+    expect(simulation.getSnapshot()).toMatchObject({
+      status: 'paused',
+      time: 100,
+    });
+    expect(trading.getSnapshot().orders).toHaveLength(0);
+    expect(trading.getSnapshot().markers.map((marker) => marker.phase)).toEqual(
+      ['open', 'close'],
+    );
+    expect(closedTrades).toHaveLength(0);
+    expect(balanceEntries).toHaveLength(0);
+    expect(stagedReviews).toHaveLength(1);
+    const review = trading.getSnapshot().pendingTradeReviews?.[0];
+    expect(review?.trade).toMatchObject({
+      ticket: order.ticket,
+      volume: 0.02,
+      closeReason: 'manual',
+    });
+    expect(() => trading.openMarket('sell', 0.01)).toThrow(
+      'Сначала заполните характеристики',
+    );
+    await expect(trading.checkpoint()).rejects.toThrow(
+      'Сначала заполните характеристики',
+    );
+    frames.advance(60_000);
+    expect(simulation.getSnapshot().time).toBe(100);
+
+    if (!review) throw new Error('Expected a trade awaiting review.');
+    await trading.saveTradeReview(review.trade.id, {
+      setup: 'Отскок',
+      result: 'По плану',
+    });
+    expect(closedTrades).toHaveLength(1);
+    expect(closedTrades[0].characteristics).toEqual({
+      setup: 'Отскок',
+      result: 'По плану',
+    });
+    expect(balanceEntries).toHaveLength(1);
+    expect(stagedReviews).toHaveLength(0);
+    expect(trading.getSnapshot().pendingTradeReviews).toHaveLength(0);
+    expect(simulation.getSnapshot().status).toBe('paused');
+    simulation.destroy();
+  });
+
+  test('interrupts a high-speed batch at the exact stop-loss second before future candles are shown', async () => {
+    const { simulation, trading, frames, closedTrades, stagedReviews } =
+      createHarness();
+    const delivered: number[][] = [];
+    simulation.onCandles((candles) =>
+      delivered.push(candles.map((candle) => candle.time)),
+    );
+    await simulation.start();
+    trading.openMarket('buy', 0.01);
+    trading.setProtection(trading.getSnapshot().orders[0].id, 'stopLoss', 99.5);
+    simulation.setSpeed(10_000);
+    frames.advance(1000);
+    await flush();
+
+    expect(simulation.getSnapshot()).toMatchObject({
+      status: 'paused',
+      time: 101,
+    });
+    expect(trading.getSnapshot().currentTime).toBe(101);
+    expect(delivered).toEqual([[100], [101]]);
+    expect(closedTrades).toHaveLength(0);
+    expect(stagedReviews).toHaveLength(1);
+    expect(trading.getSnapshot().pendingTradeReviews?.[0].trade).toMatchObject({
+      closeReason: 'stop-loss',
+      closedAt: 101,
+      exitPrice: 99.5,
+      profit: -25,
+    });
+    frames.advance(10_000);
+    expect(simulation.getSnapshot().time).toBe(101);
+    await approveReviews(trading);
+    expect(simulation.getSnapshot().status).toBe('paused');
+    simulation.play();
+    frames.advance(1);
+    await flush();
+    expect(delivered).toEqual([[100], [101], [102]]);
+    expect(simulation.getSnapshot().status).toBe('finished');
+    simulation.destroy();
+  });
+
+  test('reviews simultaneous final closures in sequence and saves each selection once', async () => {
+    const { simulation, trading, closedTrades, balanceEntries, stagedReviews } =
+      createHarness();
+    await simulation.start();
+    trading.openMarket('buy', 0.01);
+    trading.openMarket('sell', 0.02);
+    await trading.finish(100);
+    await trading.finish(100);
+    const reviews = trading.getSnapshot().pendingTradeReviews ?? [];
+    expect(reviews).toHaveLength(2);
+    expect(reviews.map((review) => review.balanceEntry.sequence)).toEqual([
+      1, 2,
+    ]);
+    expect(reviews.map((review) => review.trade.closeReason)).toEqual([
+      'simulation-end',
+      'simulation-end',
+    ]);
+    expect(stagedReviews).toHaveLength(2);
+    expect(closedTrades).toHaveLength(0);
+    await expect(
+      trading.saveTradeReview(reviews[1].trade.id, { setup: 'Второй' }),
+    ).rejects.toThrow('Сначала сохраните характеристики предыдущей сделки');
+    await trading.saveTradeReview(reviews[0].trade.id, { setup: 'Первый' });
+    expect(trading.getSnapshot().pendingTradeReviews).toHaveLength(1);
+    await expect(
+      trading.saveTradeReview(reviews[0].trade.id, { setup: 'Первый' }),
+    ).rejects.toThrow('Сначала сохраните характеристики предыдущей сделки');
+    await trading.saveTradeReview(reviews[1].trade.id, { setup: 'Второй' });
+    expect(closedTrades.map((trade) => trade.characteristics?.setup)).toEqual([
+      'Первый',
+      'Второй',
+    ]);
+    expect(balanceEntries.map((entry) => entry.sequence)).toEqual([1, 2]);
+    expect(stagedReviews).toHaveLength(0);
+    simulation.destroy();
+  });
+
   test('keeps trade markers unchanged across thousands of idle seconds and appends executions immutably', async () => {
     const { simulation, trading, session, instrument, history } =
       createHarness();
@@ -129,6 +283,7 @@ describe('trading calculations and replay execution', () => {
     simulation.pause();
     trading.openMarket('buy', 0.01);
     trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await approveReviews(trading);
     const checkpoint = await trading.checkpoint();
     trading.detach();
     simulation.destroy();
@@ -198,6 +353,7 @@ describe('trading calculations and replay execution', () => {
     expect(restored.getSnapshot().markers).not.toBe(openedMarkers);
     expect(restored.getSnapshot().markers.at(-1)?.phase).toBe('close');
     expect(openedMarkers).toHaveLength(3);
+    await approveReviews(restored);
     await restored.checkpoint();
     restored.detach();
     replay.destroy();
@@ -244,6 +400,7 @@ describe('trading calculations and replay execution', () => {
     frames.advance(1000);
     await flush();
     await trading.finish(102);
+    await approveReviews(trading);
 
     expect(trading.getSnapshot().orders).toHaveLength(0);
     expect(closedTrades).toHaveLength(1);
@@ -287,6 +444,7 @@ describe('trading calculations and replay execution', () => {
     if (!order) throw new Error('Expected the market order to open.');
     trading.closeOrder(order.id);
     await trading.finish(100);
+    await approveReviews(trading);
 
     expect(closedTrades).toHaveLength(1);
     expect(closedTrades[0]).toMatchObject({
@@ -334,6 +492,7 @@ describe('trading calculations and replay execution', () => {
     expect(trading.getSnapshot().balance).toBeCloseTo(1040);
     expect(other.trading.getSnapshot().balance).toBe(2500);
     await trading.finish(101);
+    await approveReviews(trading);
     expect(balanceEntries).toHaveLength(1);
     expect(balanceEntries[0]).toMatchObject({
       sessionId: 'session-1',
@@ -357,6 +516,7 @@ describe('trading calculations and replay execution', () => {
     await flush();
     expect(trading.getSnapshot().balance).toBeCloseTo(975);
     await trading.finish(101);
+    await approveReviews(trading);
     expect(balanceEntries[0].change).toBeCloseTo(-25);
     expect(balanceEntries[0].balance).toBeCloseTo(975);
     simulation.destroy();
@@ -380,6 +540,7 @@ describe('trading calculations and replay execution', () => {
     await flush();
     await trading.finish(101);
     await trading.finish(101);
+    await approveReviews(trading);
     expect(closedTrades).toHaveLength(2);
     expect(balanceEntries.map((entry) => entry.sequence)).toEqual([1, 2]);
     expect(balanceEntries.map((entry) => entry.time)).toEqual([101, 101]);
@@ -422,11 +583,20 @@ describe('trading calculations and replay execution', () => {
     trading.openMarket('sell', 0.02);
     frames.advance(1000);
     trading.closeOrder(trading.getSnapshot().orders[0].id);
-    await flush();
-    expect(trading.getSnapshot().error).toContain('Storage is unavailable.');
+    const first = trading.getSnapshot().pendingTradeReviews?.[0];
+    if (!first) throw new Error('Expected a trade awaiting review.');
+    await expect(trading.saveTradeReview(first.trade.id, {})).rejects.toThrow(
+      'Storage is unavailable.',
+    );
     expect(closedTrades).toHaveLength(0);
+    expect(trading.getSnapshot().pendingTradeReviews).toHaveLength(1);
+    expect(() =>
+      trading.closeOrder(trading.getSnapshot().orders[0].id),
+    ).toThrow('Сначала заполните характеристики');
 
+    await approveReviews(trading);
     trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await approveReviews(trading);
     await trading.finish(101);
     expect(attempts).toEqual([1, 1, 2]);
     expect(closedTrades).toHaveLength(2);
@@ -438,17 +608,17 @@ describe('trading calculations and replay execution', () => {
     simulation.destroy();
   });
 
-  test('retries pending history on repeated finish without duplicating saved entries', async () => {
+  test('retries staging on repeated finish without duplicating reviews or ending before a failed write', async () => {
     const { simulation, trading, history, closedTrades, balanceEntries } =
       createHarness();
-    const saveClosedTrade = history.saveClosedTrade;
+    const stageClosedTrade = history.stageClosedTrade;
     let unavailable = true;
     let attempts = 0;
     let finished = 0;
-    history.saveClosedTrade = async (trade, entry) => {
+    history.stageClosedTrade = async (review) => {
       attempts++;
       if (unavailable) throw new Error('Storage is unavailable.');
-      await saveClosedTrade(trade, entry);
+      await stageClosedTrade(review);
     };
     history.finishSession = async () => {
       finished++;
@@ -468,6 +638,9 @@ describe('trading calculations and replay execution', () => {
     unavailable = false;
     await trading.finish(100);
     await trading.finish(100);
+    expect(trading.getSnapshot().pendingTradeReviews).toHaveLength(1);
+    expect(closedTrades).toHaveLength(0);
+    await approveReviews(trading);
     expect(closedTrades).toHaveLength(1);
     expect(balanceEntries).toHaveLength(1);
     expect(finished).toBe(1);
@@ -582,7 +755,7 @@ describe('trading calculations and replay execution', () => {
     });
     expect(trading.getSnapshot().orders[0].profit).toBeCloseTo(75);
     trading.closeOrder(order.id);
-    await flush();
+    await approveReviews(trading);
     expect(closedTrades).toHaveLength(1);
     expect(closedTrades[0].volume).toBe(0.03);
     expect(closedTrades[0].profit).toBeCloseTo(75);
@@ -713,6 +886,7 @@ describe('trading calculations and replay execution', () => {
     frames.advance(1000);
     simulation.pause();
     trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await approveReviews(trading);
     trading.openMarket('buy', 0.02);
     const marketId = trading.getSnapshot().orders[0].id;
     trading.editOrder(marketId, { stopLoss: 99, takeProfit: 102 });
@@ -783,7 +957,9 @@ describe('trading calculations and replay execution', () => {
     const newOrder = restored.getSnapshot().orders[2];
     expect(newOrder.ticket).toBe(4);
     restored.closeOrder(marketId);
+    await approveReviews(restored);
     restored.closeOrder(newOrder.id);
+    await approveReviews(restored);
     const nextCheckpoint = await restored.checkpoint();
     expect(nextCheckpoint).toMatchObject({
       pointValuePer001: 5,
@@ -823,7 +999,7 @@ describe('trading calculations and replay execution', () => {
     simulation.destroy();
   });
 
-  test('failed checkpoint retains unsaved history for retry without duplicate writes', async () => {
+  test('failed review save retains the trade and blocks checkpoints until a successful retry', async () => {
     const { simulation, trading, history, closedTrades, balanceEntries } =
       createHarness();
     const save = history.saveClosedTrade;
@@ -837,17 +1013,25 @@ describe('trading calculations and replay execution', () => {
     simulation.pause();
     trading.openMarket('buy', 0.01);
     trading.closeOrder(trading.getSnapshot().orders[0].id);
+    const review = trading.getSnapshot().pendingTradeReviews?.[0];
+    if (!review) throw new Error('Expected a trade awaiting review.');
     await expect(trading.checkpoint()).rejects.toThrow(
-      'Storage is unavailable.',
+      'Сначала заполните характеристики',
     );
+    await expect(
+      trading.saveTradeReview(review.trade.id, { setup: 'Breakout' }),
+    ).rejects.toThrow('Storage is unavailable.');
+    expect(trading.getSnapshot().pendingTradeReviews?.[0]).toBe(review);
     expect(closedTrades).toHaveLength(0);
     expect(trading.getSnapshot().finished).toBe(false);
     unavailable = false;
+    await trading.saveTradeReview(review.trade.id, { setup: 'Breakout' });
     const checkpoint = await trading.checkpoint();
     await trading.checkpoint();
     expect(checkpoint.balanceSequence).toBe(1);
     expect(closedTrades).toHaveLength(1);
     expect(balanceEntries.map((entry) => entry.sequence)).toEqual([1]);
+    expect(closedTrades[0].characteristics).toEqual({ setup: 'Breakout' });
     expect(trading.getSnapshot().error).toBeUndefined();
     trading.detach();
     simulation.destroy();

@@ -1,8 +1,18 @@
+import { useState } from 'react';
+import type { TradeCharacteristic } from '../domain/trade-characteristics';
+import {
+  filterTrades,
+  type TradeHistoryFilters,
+} from '../domain/trade-filters';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
   TradingSession,
 } from '../domain/trading';
+import { CharacteristicFilterSelect } from './CharacteristicFilterSelect';
+import { TradeDateFilter } from './TradeDateFilter';
+import { Button } from './ui/button';
+import { NativeSelect, NativeSelectOption } from './ui/native-select';
 
 const dateFormat = new Intl.DateTimeFormat('ru-RU', {
   timeZone: 'UTC',
@@ -21,14 +31,63 @@ interface Props {
   session: TradingSession;
   trades: readonly ClosedTrade[];
   balanceHistory: readonly BalanceHistoryEntry[];
+  characteristics?: readonly TradeCharacteristic[];
 }
 
-export function TradingSessionHistory({
+export function TradingSessionHistory(props: Props) {
+  return <SessionHistory key={props.session.id} {...props} />;
+}
+
+function SessionHistory({
   session,
   trades,
   balanceHistory,
+  characteristics = [],
 }: Props) {
+  const [filters, setFilters] = useState<TradeHistoryFilters>({});
   const tradeTickets = new Map(trades.map((trade) => [trade.id, trade.ticket]));
+  const characteristicFilters = Object.fromEntries(
+    characteristics.map((item) => [
+      item.id,
+      filters.characteristics?.[item.id],
+    ]),
+  );
+  const filteredTrades = filterTrades(trades, {
+    ...filters,
+    characteristics: characteristicFilters,
+  });
+  const hasFilters = Boolean(
+    filters.openedAt ||
+      filters.closedAt ||
+      filters.type ||
+      filters.closeReason ||
+      Object.values(characteristicFilters).some((value) => value !== undefined),
+  );
+  const types = [
+    ...new Set(trades.map((trade) => `${trade.side} ${trade.kind}`)),
+  ].sort();
+  const reasons = [...new Set(trades.map((trade) => trade.closeReason))];
+  const fallbackTime = session.simulationStartTime ?? session.startedAt / 1000;
+  const openingBounds = trades.reduce(
+    (range, trade) => ({
+      min: Math.min(range.min, trade.openedAt),
+      max: Math.max(range.max, trade.openedAt),
+    }),
+    {
+      min: trades[0]?.openedAt ?? fallbackTime,
+      max: trades[0]?.openedAt ?? fallbackTime,
+    },
+  );
+  const closingBounds = trades.reduce(
+    (range, trade) => ({
+      min: Math.min(range.min, trade.closedAt),
+      max: Math.max(range.max, trade.closedAt),
+    }),
+    {
+      min: trades[0]?.closedAt ?? fallbackTime,
+      max: trades[0]?.closedAt ?? fallbackTime,
+    },
+  );
 
   return (
     <div className="session-history">
@@ -43,23 +102,145 @@ export function TradingSessionHistory({
         </div>
       </dl>
       <section className="session-history-section">
-        <h3>История сделок</h3>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="mb-0">История сделок</h3>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground" aria-live="polite">
+              Показано {filteredTrades.length} из {trades.length}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={!hasFilters}
+              onClick={() => setFilters({})}
+            >
+              Сбросить фильтры
+            </Button>
+          </div>
+        </div>
         <div className="sessions-table-scroll session-history-table-scroll">
           <table className="sessions-table trade-history-table">
             <thead>
               <tr>
-                <th>Время открытия UTC</th>
-                <th>Время закрытия UTC</th>
-                <th>Тип</th>
+                <th>
+                  <div className="grid justify-items-start gap-2">
+                    <span>Время открытия UTC</span>
+                    <TradeDateFilter
+                      id="history-opened-at"
+                      label="Время открытия"
+                      value={filters.openedAt}
+                      onChange={(openedAt) =>
+                        setFilters((current) => ({ ...current, openedAt }))
+                      }
+                      minTime={openingBounds.min}
+                      maxTime={openingBounds.max}
+                    />
+                  </div>
+                </th>
+                <th>
+                  <div className="grid justify-items-start gap-2">
+                    <span>Время закрытия UTC</span>
+                    <TradeDateFilter
+                      id="history-closed-at"
+                      label="Время закрытия"
+                      value={filters.closedAt}
+                      onChange={(closedAt) =>
+                        setFilters((current) => ({ ...current, closedAt }))
+                      }
+                      minTime={closingBounds.min}
+                      maxTime={closingBounds.max}
+                    />
+                  </div>
+                </th>
+                <th>
+                  <div className="grid justify-items-start gap-2">
+                    <span>Тип</span>
+                    <NativeSelect
+                      size="sm"
+                      className="bg-white text-xs font-normal"
+                      aria-label="Фильтр: Тип"
+                      value={filters.type ?? ''}
+                      onChange={(event) =>
+                        setFilters((current) => ({
+                          ...current,
+                          type: event.target.value || undefined,
+                        }))
+                      }
+                    >
+                      <NativeSelectOption value="">Все типы</NativeSelectOption>
+                      {types.map((type) => (
+                        <NativeSelectOption key={type} value={type}>
+                          {type.replace(/^(buy|sell)/, (side) =>
+                            side.toUpperCase(),
+                          )}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  </div>
+                </th>
                 <th>Объём</th>
                 <th>Вход</th>
                 <th>Выход</th>
                 <th>Результат, USD</th>
-                <th>Причина закрытия</th>
+                <th>
+                  <div className="grid justify-items-start gap-2">
+                    <span>Причина закрытия</span>
+                    <NativeSelect
+                      size="sm"
+                      className="bg-white text-xs font-normal"
+                      aria-label="Фильтр: Причина закрытия"
+                      value={filters.closeReason ?? ''}
+                      onChange={(event) =>
+                        setFilters((current) => ({
+                          ...current,
+                          closeReason: event.target.value
+                            ? (event.target.value as ClosedTrade['closeReason'])
+                            : undefined,
+                        }))
+                      }
+                    >
+                      <NativeSelectOption value="">
+                        Все причины
+                      </NativeSelectOption>
+                      {reasons.map((reason) => (
+                        <NativeSelectOption key={reason} value={reason}>
+                          {reasonLabel(reason)}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  </div>
+                </th>
+                {characteristics.map((characteristic) => (
+                  <th key={characteristic.id}>
+                    <div className="grid justify-items-start gap-2">
+                      <span>{characteristic.name}</span>
+                      <CharacteristicFilterSelect
+                        characteristic={characteristic}
+                        value={filters.characteristics?.[characteristic.id]}
+                        onChange={(value) =>
+                          setFilters((current) => ({
+                            ...current,
+                            characteristics: {
+                              ...current.characteristics,
+                              [characteristic.id]: value,
+                            },
+                          }))
+                        }
+                        knownValues={trades.flatMap((trade) => {
+                          const value =
+                            trade.characteristics?.[characteristic.id];
+                          return value === undefined ? [] : [value];
+                        })}
+                        idPrefix="history-characteristic-filter"
+                      />
+                    </div>
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {trades.map((trade) => (
+              {filteredTrades.map((trade) => (
                 <tr key={trade.id}>
                   <td>{dateFormat.format(trade.openedAt * 1000)}</td>
                   <td>{dateFormat.format(trade.closedAt * 1000)}</td>
@@ -79,12 +260,22 @@ export function TradingSessionHistory({
                     {moneyFormat.format(trade.profit)}
                   </td>
                   <td>{reasonLabel(trade.closeReason)}</td>
+                  {characteristics.map((characteristic) => (
+                    <td key={characteristic.id}>
+                      {trade.characteristics?.[characteristic.id] ?? '-'}
+                    </td>
+                  ))}
                 </tr>
               ))}
-              {!trades.length && (
+              {!filteredTrades.length && (
                 <tr>
-                  <td colSpan={8} className="trading-empty-row">
-                    Закрытых сделок пока нет
+                  <td
+                    colSpan={8 + characteristics.length}
+                    className="trading-empty-row"
+                  >
+                    {trades.length
+                      ? 'Нет сделок по выбранным фильтрам'
+                      : 'Закрытых сделок пока нет'}
                   </td>
                 </tr>
               )}

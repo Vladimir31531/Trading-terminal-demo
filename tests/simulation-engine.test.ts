@@ -141,6 +141,163 @@ describe('simulation settings and replay aggregation', () => {
 });
 
 describe('simulation engine', () => {
+  test('execution pauses interrupt a fast batch at the exact source second and discard its backlog', async () => {
+    const frames = new Frames();
+    const engine = new SimulationEngine(
+      'dataset',
+      { ...settings, speed: 1000 },
+      source(Array.from({ length: 20 }, (_, index) => candle(100 + index)))
+        .repository,
+      frames,
+    );
+    const ticks: number[] = [];
+    const batches: number[][] = [];
+    engine.onCandle((bar) => {
+      ticks.push(bar.time);
+      expect(engine.getSnapshot().time).toBe(bar.time);
+      if (bar.time === 103) engine.pause();
+    });
+    engine.onCandles((bars) => batches.push(bars.map((bar) => bar.time)));
+    await engine.start();
+
+    frames.advance(800.5);
+
+    expect(engine.getSnapshot()).toMatchObject({
+      time: 103,
+      status: 'paused',
+    });
+    expect(ticks).toEqual([100, 101, 102, 103]);
+    expect(batches).toEqual([[100], [101, 102, 103]]);
+    expect(engine.exportCheckpoint().budget).toBe(0.5);
+    expect(frames.pending).toBe(0);
+    frames.advance(60_000);
+    engine.setSpeed(1);
+    engine.play();
+    frames.advance(499);
+    expect(engine.getSnapshot().time).toBe(103);
+    frames.advance(1);
+    expect(engine.getSnapshot().time).toBe(104);
+    expect(ticks).toEqual([100, 101, 102, 103, 104]);
+    engine.destroy();
+  });
+
+  test('an execution pause on the first candle does not deliver future candles', async () => {
+    const frames = new Frames();
+    const engine = new SimulationEngine(
+      'dataset',
+      settings,
+      source([candle(100), candle(101)]).repository,
+      frames,
+    );
+    const received: number[] = [];
+    const unsubscribe = engine.onCandle(() => engine.pause());
+    engine.onCandles((bars) => received.push(...bars.map((bar) => bar.time)));
+    await engine.start();
+    expect(engine.getSnapshot()).toMatchObject({
+      time: 100,
+      status: 'paused',
+    });
+    expect(received).toEqual([100]);
+    expect(frames.pending).toBe(0);
+    unsubscribe();
+    engine.play();
+    frames.advance(1000);
+    expect(received).toEqual([100, 101]);
+    expect(engine.getSnapshot().status).toBe('finished');
+    engine.destroy();
+  });
+
+  test('execution pauses across prefetched pages retain the untouched next record', async () => {
+    const frames = new Frames();
+    const data = source(
+      Array.from({ length: 1602 }, (_, index) => candle(100 + index)),
+    );
+    const engine = new SimulationEngine(
+      'dataset',
+      { ...settings, endTime: 2000, speed: 1000 },
+      data.repository,
+      frames,
+    );
+    const received: number[] = [];
+    engine.onCandle((bar) => {
+      if (bar.time === 900) engine.pause();
+    });
+    engine.onCandles((bars) => received.push(...bars.map((bar) => bar.time)));
+    await engine.start();
+    frames.advance(600);
+    await flush();
+    expect(data.requests.map((request) => request.after)).toEqual([
+      undefined,
+      899,
+    ]);
+    frames.advance(800);
+    expect(engine.getSnapshot()).toMatchObject({
+      time: 900,
+      status: 'paused',
+    });
+    expect(received).toEqual(
+      Array.from({ length: 801 }, (_, index) => 100 + index),
+    );
+    engine.setSpeed(1);
+    engine.play();
+    frames.advance(1000);
+    expect(received.at(-1)).toBe(901);
+    expect(new Set(received).size).toBe(received.length);
+    engine.destroy();
+  });
+
+  test('pausing on the last source candle defers completion until explicit Play', async () => {
+    const frames = new Frames();
+    const engine = new SimulationEngine(
+      'dataset',
+      settings,
+      source([candle(100), candle(101)]).repository,
+      frames,
+    );
+    let completed = 0;
+    engine.onCandle((bar) => {
+      if (bar.time === 101) engine.pause();
+    });
+    engine.subscribe(() => {
+      if (engine.getSnapshot().status === 'finished') completed++;
+    });
+    await engine.start();
+    frames.advance(1000);
+    expect(engine.getSnapshot()).toMatchObject({
+      time: 101,
+      status: 'paused',
+    });
+    expect(engine.exportCheckpoint().time).toBe(101);
+    expect(completed).toBe(0);
+    engine.play();
+    expect(engine.getSnapshot().status).toBe('finished');
+    expect(completed).toBe(1);
+    engine.destroy();
+  });
+
+  test('pausing from a chart batch callback cannot recursively deliver the same elapsed time', async () => {
+    const frames = new Frames();
+    const engine = new SimulationEngine(
+      'dataset',
+      settings,
+      source([100, 101, 102, 103, 104].map((time) => candle(time))).repository,
+      frames,
+    );
+    const received: number[] = [];
+    engine.onCandles((bars) => {
+      received.push(...bars.map((bar) => bar.time));
+      if (bars.at(-1)?.time === 102) engine.pause();
+    });
+    await engine.start();
+    frames.advance(2000);
+    expect(received).toEqual([100, 101, 102]);
+    expect(engine.getSnapshot().status).toBe('paused');
+    engine.play();
+    frames.advance(1000);
+    expect(received).toEqual([100, 101, 102, 103]);
+    engine.destroy();
+  });
+
   test('awaiting restored preparation reports a read error without delivering candles', async () => {
     const frames = new Frames();
     const loading = deferred<HistoryPage>();

@@ -1,8 +1,14 @@
 import Dexie, { liveQuery, type Table } from 'dexie';
 import type { SavedSimulation } from '../domain/saved-simulation';
+import {
+  normalizeTradeCharacteristic,
+  type TradeCharacteristic,
+  validateTradeCharacteristicSelections,
+} from '../domain/trade-characteristics';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
+  PendingTradeReview,
   TradingSession,
   TradingSessionSummary,
 } from '../domain/trading';
@@ -12,6 +18,8 @@ class TradingDatabase extends Dexie {
   trades!: Table<ClosedTrade, string>;
   balanceHistory!: Table<BalanceHistoryEntry, string>;
   suspendedSimulations!: Table<SavedSimulation, string>;
+  tradeCharacteristics!: Table<TradeCharacteristic, string>;
+  pendingTradeReviews!: Table<PendingTradeReview, string>;
 
   constructor() {
     super('terminal-demo-trading');
@@ -30,12 +38,91 @@ class TradingDatabase extends Dexie {
       balanceHistory: 'id, sessionId, [sessionId+sequence]',
       suspendedSimulations: 'sessionId, savedAt',
     });
+    this.version(4).stores({
+      tradeCharacteristics: 'id, createdAt',
+      pendingTradeReviews: 'trade.id, trade.sessionId',
+    });
   }
 }
 
 const database = new TradingDatabase();
 
 export const tradingHistory = {
+  watchCharacteristics(
+    onChange: (characteristics: TradeCharacteristic[]) => void,
+    onError: (cause: unknown) => void,
+  ): () => void {
+    const subscription = liveQuery(() =>
+      database.tradeCharacteristics.orderBy('createdAt').toArray(),
+    ).subscribe({ next: onChange, error: onError });
+    return () => subscription.unsubscribe();
+  },
+
+  async saveCharacteristic(characteristic: TradeCharacteristic): Promise<void> {
+    const normalized = normalizeTradeCharacteristic(characteristic);
+    await database.transaction(
+      'rw',
+      database.tradeCharacteristics,
+      async () => {
+        const characteristics = await database.tradeCharacteristics.toArray();
+        if (
+          characteristics.some(
+            (item) =>
+              item.id !== normalized.id &&
+              item.name.toLocaleLowerCase() ===
+                normalized.name.toLocaleLowerCase(),
+          )
+        )
+          throw new Error('Характеристика с таким названием уже существует.');
+        await database.tradeCharacteristics.put(normalized);
+      },
+    );
+  },
+
+  async deleteCharacteristic(id: string): Promise<void> {
+    // Recorded selections stay on their trades when a definition is removed.
+    await database.tradeCharacteristics.delete(id);
+  },
+
+  async stageClosedTrade(review: PendingTradeReview): Promise<void> {
+    const { trade, balanceEntry } = review;
+    if (
+      balanceEntry.sessionId !== trade.sessionId ||
+      balanceEntry.tradeId !== trade.id
+    )
+      throw new Error('Запись баланса не соответствует закрытой сделке.');
+    await database.transaction(
+      'rw',
+      database.sessions,
+      database.trades,
+      database.pendingTradeReviews,
+      async () => {
+        if (!(await database.sessions.get(trade.sessionId)))
+          throw new Error('Торговая сессия больше не существует.');
+        if (
+          !(await database.trades.get(trade.id)) &&
+          !(await database.pendingTradeReviews.get(trade.id))
+        )
+          await database.pendingTradeReviews.add(review);
+      },
+    );
+  },
+
+  watchPendingTradeReviews(
+    onChange: (reviews: PendingTradeReview[]) => void,
+    onError: (cause: unknown) => void,
+  ): () => void {
+    const subscription = liveQuery(async () => {
+      const reviews = await database.pendingTradeReviews.toArray();
+      return reviews.sort(
+        (left, right) =>
+          left.trade.sessionId.localeCompare(right.trade.sessionId) ||
+          left.balanceEntry.sequence - right.balanceEntry.sequence,
+      );
+    }).subscribe({ next: onChange, error: onError });
+    return () => subscription.unsubscribe();
+  },
+
   async startSession(session: TradingSession): Promise<void> {
     const { initialBalance, simulationStartTime } = session;
     if (
@@ -156,9 +243,20 @@ export const tradingHistory = {
       database.sessions,
       database.trades,
       database.balanceHistory,
+      database.pendingTradeReviews,
+      database.tradeCharacteristics,
       async () => {
         const session = await database.sessions.get(trade.sessionId);
         if (!session) throw new Error('Торговая сессия больше не существует.');
+        if (await database.trades.get(trade.id)) {
+          await database.pendingTradeReviews.delete(trade.id);
+          return;
+        }
+        if (trade.characteristics !== undefined)
+          validateTradeCharacteristicSelections(
+            await database.tradeCharacteristics.toArray(),
+            trade.characteristics,
+          );
         await database.trades.add(trade);
         await database.balanceHistory.add(entry);
         await database.sessions.update(trade.sessionId, {
@@ -166,6 +264,7 @@ export const tradingHistory = {
           totalProfit: session.totalProfit + trade.profit,
           balance: entry.balance,
         });
+        await database.pendingTradeReviews.delete(trade.id);
       },
     );
   },
@@ -228,6 +327,7 @@ export const tradingHistory = {
       database.trades,
       database.balanceHistory,
       database.suspendedSimulations,
+      database.pendingTradeReviews,
       async () => {
         await database.trades.where('sessionId').equals(sessionId).delete();
         await database.balanceHistory
@@ -235,6 +335,10 @@ export const tradingHistory = {
           .equals(sessionId)
           .delete();
         await database.suspendedSimulations.delete(sessionId);
+        await database.pendingTradeReviews
+          .where('trade.sessionId')
+          .equals(sessionId)
+          .delete();
         await database.sessions.delete(sessionId);
       },
     );

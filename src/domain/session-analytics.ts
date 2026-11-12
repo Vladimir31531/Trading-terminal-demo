@@ -128,6 +128,7 @@ export function analyzeTradingSession(
   session: TradingSession,
   closedTrades: readonly ClosedTrade[],
   balanceHistory: readonly BalanceHistoryEntry[] = [],
+  options: { balanceSource?: 'recorded' | 'trades' } = {},
 ): SessionAnalytics {
   const historyByTrade = new Map(
     balanceHistory
@@ -204,7 +205,10 @@ export function analyzeTradingSession(
     addTrade(totals, trade.profit);
     holdSeconds += Math.max(0, trade.closedAt - trade.openedAt);
     if (balance !== undefined) {
-      balance = historyByTrade.get(trade.id)?.balance ?? balance + trade.profit;
+      balance =
+        options.balanceSource === 'trades'
+          ? balance + trade.profit
+          : (historyByTrade.get(trade.id)?.balance ?? balance + trade.profit);
     }
     const value = balance ?? totals.net;
     peak = Math.max(peak, value);

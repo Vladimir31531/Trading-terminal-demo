@@ -29,6 +29,7 @@ export class SimulationEngine {
   readonly settings: Readonly<SimulationSettings>;
   private snapshot: SimulationSnapshot;
   private readonly listeners = new Set<() => void>();
+  private readonly tickListeners = new Set<(candle: Candle) => void>();
   private readonly candleListeners = new Set<(candles: Candle[]) => void>();
   private readonly controller = new AbortController();
   private page: Candle[] = [];
@@ -47,6 +48,7 @@ export class SimulationEngine {
   private frame: number | undefined;
   private lastFrame: number | undefined;
   private budget = 0;
+  private settling = false;
 
   constructor(
     readonly datasetId: string,
@@ -130,6 +132,12 @@ export class SimulationEngine {
     return () => this.candleListeners.delete(listener);
   }
 
+  /** Observe execution one source second at a time, before chart batch delivery. */
+  onCandle(listener: (candle: Candle) => void): () => void {
+    this.tickListeners.add(listener);
+    return () => this.tickListeners.delete(listener);
+  }
+
   start(): Promise<void> {
     if (this.started) return this.preparation ?? Promise.resolve();
     if (this.disposed) return Promise.resolve();
@@ -182,6 +190,7 @@ export class SimulationEngine {
     if (typeof document !== 'undefined')
       document.removeEventListener('visibilitychange', this.visibilityChanged);
     this.listeners.clear();
+    this.tickListeners.clear();
     this.candleListeners.clear();
     this.page = [];
     this.nextPage = undefined;
@@ -260,28 +269,45 @@ export class SimulationEngine {
   };
 
   private settle(timestamp: number): void {
-    if (!this.clockRunning() || this.lastFrame === undefined) return;
+    if (this.settling || !this.clockRunning() || this.lastFrame === undefined)
+      return;
     this.budget +=
       (Math.max(0, timestamp - this.lastFrame) / 1000) * this.snapshot.speed;
     this.lastFrame = timestamp;
     const count = Math.min(Math.floor(this.budget), PAGE_SIZE);
     if (!count) return;
     const candles: Candle[] = [];
-    while (candles.length < count && this.remaining()) {
-      candles.push(this.page[this.index++]);
-      if (!this.remaining() && this.nextPage) this.promotePage();
+    this.settling = true;
+    try {
+      while (candles.length < count && this.remaining()) {
+        const candle = this.page[this.index++];
+        candles.push(candle);
+        if (!this.remaining() && this.nextPage) this.promotePage();
+        this.deliverTick(candle);
+        if (!this.wantsPlay || this.holds || this.hidden || this.ended()) break;
+      }
+      this.budget -= candles.length;
+      this.deliver(candles);
+      // An execution pause must not leave a backlog that jumps prices on Play.
+      if (!this.wantsPlay || this.holds || this.hidden) this.budget %= 1;
+    } finally {
+      this.settling = false;
     }
-    this.budget -= candles.length;
-    this.deliver(candles);
     if (this.ended()) return;
     this.prefetch();
     if (!this.remaining()) {
       this.cancelFrame();
       // Network latency is buffering, not simulated elapsed time.
       this.budget = 0;
-      if (!this.hasMore && !this.fetching) this.finish();
+      if (this.wantsPlay && !this.hasMore && !this.fetching) this.finish();
       else this.updateStatus();
     }
+  }
+
+  private deliverTick(candle: Candle): void {
+    if (!this.tickListeners.size || this.disposed) return;
+    this.snapshot = { ...this.snapshot, time: candle.time };
+    for (const listener of this.tickListeners) listener(candle);
   }
 
   private deliver(candles: Candle[]): void {
@@ -311,7 +337,14 @@ export class SimulationEngine {
       this.remaining()
     ) {
       this.delivered = true;
-      this.deliver([this.page[this.index++]]);
+      const candle = this.page[this.index++];
+      this.settling = true;
+      try {
+        this.deliverTick(candle);
+        this.deliver([candle]);
+      } finally {
+        this.settling = false;
+      }
     }
     if (
       this.wantsPlay &&

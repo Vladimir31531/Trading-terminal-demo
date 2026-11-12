@@ -459,6 +459,14 @@ export function SessionSummary({ session, trades, balanceHistory }: Props) {
     () => analyzeTradingSession(session, trades, balanceHistory),
     [session, trades, balanceHistory],
   );
+  return <SessionSummaryView analytics={analytics} />;
+}
+
+export function SessionSummaryView({
+  analytics,
+}: {
+  analytics: SessionAnalytics;
+}) {
   const [growth, setGrowth] = useState(false);
   const options = useMemo<ApexOptions>(
     () => ({

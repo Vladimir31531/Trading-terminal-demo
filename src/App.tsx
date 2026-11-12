@@ -21,6 +21,7 @@ import { InstrumentDialog } from './components/InstrumentDialog';
 import { MarketChart, type MarketChartHandle } from './components/MarketChart';
 import { SimulationControls } from './components/SimulationControls';
 import { SimulationDialog } from './components/SimulationDialog';
+import { TradeReviewDialog } from './components/TradeReviewDialog';
 import { TradingControls } from './components/TradingControls';
 import { TradingSessionsPage } from './components/TradingSessionsPage';
 import { Button } from './components/ui/button';
@@ -130,10 +131,19 @@ export default function App() {
   );
   useEffect(() => {
     if (simulation && simulation.datasetId !== selected?.datasetId) {
-      void trading?.finish(simulation.getSnapshot().time);
-      simulation.destroy();
-      setSimulation(undefined);
-      setTrading(undefined);
+      simulation.pause();
+      void (async () => {
+        await trading?.finish(simulation.getSnapshot().time);
+        if (trading?.getSnapshot().error) {
+          setSessionError(trading.getSnapshot().error);
+          return;
+        }
+        simulation.destroy();
+        setSimulation((current) =>
+          current === simulation ? undefined : current,
+        );
+        setTrading((current) => (current === trading ? undefined : current));
+      })();
     }
   }, [simulation, selected?.datasetId, trading]);
 
@@ -712,6 +722,7 @@ export default function App() {
           )}
         </main>
       </div>
+      <TradeReviewDialog engine={trading} simulation={simulation} />
       <InstrumentDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}

@@ -41,6 +41,8 @@ export interface ClosedTrade {
   closedAt: number;
   profit: number;
   closeReason: TradeCloseReason;
+  /** Missing on trades recorded before trade characteristics were introduced. */
+  characteristics?: Record<string, string>;
 }
 
 export interface TradingSession {
@@ -73,6 +75,12 @@ export interface BalanceHistoryEntry {
   tradeId?: string;
 }
 
+/** Closed execution awaiting review, separate from the confirmed trade history. */
+export interface PendingTradeReview {
+  trade: ClosedTrade;
+  balanceEntry: BalanceHistoryEntry;
+}
+
 export interface TradingSnapshot {
   sessionId: string;
   currentTime: number;
@@ -80,6 +88,8 @@ export interface TradingSnapshot {
   currentPrice?: number;
   orders: TradeOrder[];
   markers: TradeMarker[];
+  /** Absent in checkpoints created before trade characteristics were introduced. */
+  pendingTradeReviews?: PendingTradeReview[];
   error?: string;
   finished: boolean;
 }

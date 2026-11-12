@@ -3,6 +3,7 @@ import {
   type BalanceHistoryEntry,
   type ClosedTrade,
   calculateProfit,
+  type PendingTradeReview,
   type ProtectionLevels,
   type TradeCloseReason,
   type TradeMarker,
@@ -20,6 +21,7 @@ import {
 import type { SimulationEngine } from './simulation-engine';
 
 interface TradingHistoryWriter {
+  stageClosedTrade(review: PendingTradeReview): Promise<void>;
   saveClosedTrade(
     trade: ClosedTrade,
     entry: BalanceHistoryEntry,
@@ -34,7 +36,11 @@ export class TradingEngine {
   private balanceSequence = 0;
   private readonly listeners = new Set<() => void>();
   private unsubscribeCandles?: () => void;
+  private unsubscribeCandle?: () => void;
   private unsubscribeSimulation?: () => void;
+  private simulation?: SimulationEngine;
+  private releaseReviewHold?: () => void;
+  private savingReview = false;
   private readonly pendingWrites: (() => Promise<void>)[] = [];
   private writeChain = Promise.resolve();
   private closed = false;
@@ -56,6 +62,7 @@ export class TradingEngine {
       balance: initialBalance,
       orders: [],
       markers: [],
+      pendingTradeReviews: [],
       finished: false,
     };
   }
@@ -106,10 +113,15 @@ export class TradingEngine {
   }
 
   detach(): void {
+    this.unsubscribeCandle?.();
     this.unsubscribeCandles?.();
     this.unsubscribeSimulation?.();
+    this.unsubscribeCandle = undefined;
     this.unsubscribeCandles = undefined;
     this.unsubscribeSimulation = undefined;
+    this.releaseReviewHold?.();
+    this.releaseReviewHold = undefined;
+    this.simulation = undefined;
   }
 
   getSnapshot = (): TradingSnapshot => this.snapshot;
@@ -121,12 +133,15 @@ export class TradingEngine {
 
   connect(simulation: SimulationEngine): void {
     this.detach();
-    this.unsubscribeCandles = simulation.onCandles(this.processCandles);
+    this.simulation = simulation;
+    this.unsubscribeCandle = simulation.onCandle(this.processCandle);
+    this.unsubscribeCandles = simulation.onCandles(() => this.publish());
     this.unsubscribeSimulation = simulation.subscribe(() => {
       const status = simulation.getSnapshot().status;
       if (status === 'finished' || status === 'error')
         void this.finish(simulation.getSnapshot().time);
     });
+    if (this.snapshot.pendingTradeReviews?.length) this.pauseForReview();
   }
 
   setPointValuePer001(value: number): void {
@@ -277,6 +292,9 @@ export class TradingEngine {
       this.publish();
       return;
     }
+    this.simulation?.pause();
+    // Settling the clock may have closed this position through its protection.
+    if (!this.snapshot.orders.some((item) => item.id === id)) return;
     this.closePosition(
       order,
       this.snapshot.currentPrice ?? order.price,
@@ -284,6 +302,36 @@ export class TradingEngine {
       'manual',
     );
     this.publish();
+  }
+
+  async saveTradeReview(
+    id: string,
+    characteristics: Record<string, string>,
+  ): Promise<void> {
+    if (this.savingReview) throw new Error('Сделка уже сохраняется.');
+    const review = this.snapshot.pendingTradeReviews?.[0];
+    if (!review || review.trade.id !== id)
+      throw new Error('Сначала сохраните характеристики предыдущей сделки.');
+    this.savingReview = true;
+    try {
+      await this.flushWrites();
+      if (this.snapshot.error) throw new Error(this.snapshot.error);
+      await this.history.saveClosedTrade(
+        { ...review.trade, characteristics: { ...characteristics } },
+        review.balanceEntry,
+      );
+      this.snapshot.pendingTradeReviews =
+        this.snapshot.pendingTradeReviews?.filter(
+          (item) => item.trade.id !== id,
+        );
+      if (!this.snapshot.pendingTradeReviews?.length) {
+        this.releaseReviewHold?.();
+        this.releaseReviewHold = undefined;
+      }
+      this.publish();
+    } finally {
+      this.savingReview = false;
+    }
   }
 
   async finish(time = this.snapshot.currentTime): Promise<void> {
@@ -305,26 +353,23 @@ export class TradingEngine {
     await this.writeChain;
   }
 
-  private readonly processCandles = (candles: Candle[]): void => {
-    for (const candle of candles) {
-      this.snapshot.currentTime = candle.time;
-      this.snapshot.currentPrice = candle.close;
-      const filledOrders = this.tryFillPending(
-        candle.close,
-        candle.time,
-        candle.low,
-        candle.high,
-      );
-      this.checkProtection(
-        candle.close,
-        candle.time,
-        candle.low,
-        candle.high,
-        filledOrders,
-      );
-      this.recalculateOpenProfit();
-    }
-    this.publish();
+  private readonly processCandle = (candle: Candle): void => {
+    this.snapshot.currentTime = candle.time;
+    this.snapshot.currentPrice = candle.close;
+    const filledOrders = this.tryFillPending(
+      candle.close,
+      candle.time,
+      candle.low,
+      candle.high,
+    );
+    this.checkProtection(
+      candle.close,
+      candle.time,
+      candle.low,
+      candle.high,
+      filledOrders,
+    );
+    this.recalculateOpenProfit();
   };
 
   private tryFillPending(
@@ -452,9 +497,19 @@ export class TradingEngine {
       balance: this.snapshot.balance,
       tradeId: closedTrade.id,
     };
-    this.enqueueWrite(() =>
-      this.history.saveClosedTrade(closedTrade, balanceEntry),
-    );
+    const review = { trade: closedTrade, balanceEntry };
+    this.snapshot.pendingTradeReviews = [
+      ...(this.snapshot.pendingTradeReviews ?? []),
+      review,
+    ];
+    this.pauseForReview();
+    this.enqueueWrite(() => this.history.stageClosedTrade(review));
+  }
+
+  private pauseForReview(): void {
+    this.simulation?.pause();
+    if (!this.releaseReviewHold)
+      this.releaseReviewHold = this.simulation?.hold();
   }
 
   private recalculateOpenProfit(): void {
@@ -486,6 +541,8 @@ export class TradingEngine {
   private assertActive(): void {
     if (this.closed || this.snapshot.finished)
       throw new Error('Торговая сессия уже завершена.');
+    if (this.snapshot.pendingTradeReviews?.length)
+      throw new Error('Сначала заполните характеристики закрытой сделки.');
   }
 
   private enqueueWrite(write: () => Promise<void>): void {

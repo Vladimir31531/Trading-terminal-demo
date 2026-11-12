@@ -1,13 +1,16 @@
 import { ArrowLeft, LoaderCircle, Play, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { SavedSimulation } from '../domain/saved-simulation';
+import type { TradeCharacteristic } from '../domain/trade-characteristics';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
   TradingSessionSummary,
 } from '../domain/trading';
 import { tradingHistory } from '../infrastructure/trading-history';
+import { CustomSessionAnalytics } from './CustomSessionAnalytics';
 import { SessionProfitLoss, SessionSummary } from './SessionAnalytics';
+import { TradeCharacteristicsPage } from './TradeCharacteristicsPage';
 import { TradingSessionHistory } from './TradingSessionHistory';
 import { Button } from './ui/button';
 import {
@@ -62,11 +65,35 @@ export function TradingSessionsPage({
   const [busy, setBusy] = useState(false);
   const [resumingId, setResumingId] = useState<string>();
   const [resumeError, setResumeError] = useState<string>();
+  const [characteristics, setCharacteristics] = useState<TradeCharacteristic[]>(
+    [],
+  );
+  const [characteristicsError, setCharacteristicsError] = useState<string>();
+  const [characteristicsLoading, setCharacteristicsLoading] = useState(true);
   const selected = sessions.find((session) => session.id === selectedId);
-  const detailError = error ?? tradesError ?? balanceError;
+  const detailError =
+    error ?? tradesError ?? balanceError ?? characteristicsError;
   const savedBySession = new Map(
     savedSimulations.map((saved) => [saved.sessionId, saved]),
   );
+
+  useEffect(() => {
+    return tradingHistory.watchCharacteristics(
+      (items) => {
+        setCharacteristics(items);
+        setCharacteristicsError(undefined);
+        setCharacteristicsLoading(false);
+      },
+      (cause) => {
+        setCharacteristicsError(
+          cause instanceof Error
+            ? cause.message
+            : 'Не удалось прочитать характеристики сделок.',
+        );
+        setCharacteristicsLoading(false);
+      },
+    );
+  }, []);
 
   useEffect(() => {
     return tradingHistory.watchSessions(
@@ -246,7 +273,10 @@ export function TradingSessionsPage({
           <div className="sessions-state" role="alert">
             {detailError}
           </div>
-        ) : loading || tradesLoading || balanceLoading ? (
+        ) : loading ||
+          tradesLoading ||
+          balanceLoading ||
+          characteristicsLoading ? (
           <div className="sessions-state" role="status">
             <LoaderCircle className="animate-spin" size={18} /> Загружаем
             историю сессии…
@@ -261,12 +291,14 @@ export function TradingSessionsPage({
               <TabsTrigger value="history">История сделок</TabsTrigger>
               <TabsTrigger value="summary">Summary</TabsTrigger>
               <TabsTrigger value="profit-loss">Profit &amp; Loss</TabsTrigger>
+              <TabsTrigger value="custom">Custom</TabsTrigger>
             </TabsList>
             <TabsContent value="history" className="session-tab-content">
               <TradingSessionHistory
                 session={selected}
                 trades={trades}
                 balanceHistory={balanceHistory}
+                characteristics={characteristics}
               />
             </TabsContent>
             <TabsContent value="summary" className="session-tab-content">
@@ -283,100 +315,125 @@ export function TradingSessionsPage({
                 balanceHistory={balanceHistory}
               />
             </TabsContent>
+            <TabsContent value="custom" className="session-tab-content">
+              <CustomSessionAnalytics
+                session={selected}
+                trades={trades}
+                balanceHistory={balanceHistory}
+                characteristics={characteristics}
+              />
+            </TabsContent>
           </Tabs>
         ) : (
           <div className="sessions-state">
             Торговая сессия больше не существует.
           </div>
         )
-      ) : loading ? (
-        <div className="sessions-state">
-          <LoaderCircle className="animate-spin" size={18} /> Загружаем сессии…
-        </div>
-      ) : sessions.length ? (
-        <div className="sessions-table-scroll">
-          <table className="sessions-table">
-            <thead>
-              <tr>
-                <th>Инструмент</th>
-                <th>Начало UTC</th>
-                <th>Завершена UTC</th>
-                <th>Сделок</th>
-                <th>Начальный баланс, USD</th>
-                <th>Баланс, USD</th>
-                <th>Результат</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {sessions.map((session) => {
-                const saved =
-                  session.endedAt === undefined
-                    ? savedBySession.get(session.id)
-                    : undefined;
-                return (
-                  <tr key={session.id}>
-                    <td>
-                      <button
-                        type="button"
-                        className="session-open"
-                        onClick={() => openSession(session.id)}
-                      >
-                        {session.ticker}
-                      </button>
-                    </td>
-                    <td>{dateFormat.format(session.startedAt)}</td>
-                    <td>
-                      {session.endedAt !== undefined
-                        ? dateFormat.format(session.endedAt)
-                        : saved
-                          ? 'Приостановлена'
-                          : 'Активна'}
-                      {saved && (
-                        <small className="block text-muted-foreground">
-                          {dateFormat.format(saved.replay.time * 1000)} UTC
-                        </small>
-                      )}
-                    </td>
-                    <td>{session.tradeCount}</td>
-                    <td>{formatBalance(session.initialBalance)}</td>
-                    <td>{formatBalance(session.balance)}</td>
-                    <td
-                      className={
-                        session.totalProfit >= 0
-                          ? 'trade-profit-positive'
-                          : 'trade-profit-negative'
-                      }
-                    >
-                      {moneyFormat.format(session.totalProfit)}
-                    </td>
-                    <td>
-                      {resumeButton(session)}
-                      <Button
-                        type="button"
-                        size="icon-xs"
-                        variant="ghost"
-                        aria-label={`Удалить сессию ${session.ticker} от ${dateFormat.format(session.startedAt)}`}
-                        title="Удалить сессию"
-                        disabled={busy || Boolean(resumingId)}
-                        onClick={() => {
-                          setDeletionError(undefined);
-                          setDeleting(session);
-                        }}
-                      >
-                        <Trash2 size={14} />
-                      </Button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
       ) : (
-        <div className="sessions-state">
-          Торговых сессий пока нет. Они появятся после запуска симуляции.
-        </div>
+        <Tabs defaultValue="sessions" className="min-w-0 gap-5">
+          <TabsList aria-label="Разделы журнала торговли">
+            <TabsTrigger value="sessions">Торговые сессии</TabsTrigger>
+            <TabsTrigger value="characteristics">
+              Характеристики сделок
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="sessions" className="min-w-0">
+            {loading ? (
+              <div className="sessions-state">
+                <LoaderCircle className="animate-spin" size={18} /> Загружаем
+                сессии…
+              </div>
+            ) : sessions.length ? (
+              <div className="sessions-table-scroll">
+                <table className="sessions-table">
+                  <thead>
+                    <tr>
+                      <th>Инструмент</th>
+                      <th>Начало UTC</th>
+                      <th>Завершена UTC</th>
+                      <th>Сделок</th>
+                      <th>Начальный баланс, USD</th>
+                      <th>Баланс, USD</th>
+                      <th>Результат</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sessions.map((session) => {
+                      const saved =
+                        session.endedAt === undefined
+                          ? savedBySession.get(session.id)
+                          : undefined;
+                      return (
+                        <tr key={session.id}>
+                          <td>
+                            <button
+                              type="button"
+                              className="session-open"
+                              onClick={() => openSession(session.id)}
+                            >
+                              {session.ticker}
+                            </button>
+                          </td>
+                          <td>{dateFormat.format(session.startedAt)}</td>
+                          <td>
+                            {session.endedAt !== undefined
+                              ? dateFormat.format(session.endedAt)
+                              : saved
+                                ? 'Приостановлена'
+                                : 'Активна'}
+                            {saved && (
+                              <small className="block text-muted-foreground">
+                                {dateFormat.format(saved.replay.time * 1000)}{' '}
+                                UTC
+                              </small>
+                            )}
+                          </td>
+                          <td>{session.tradeCount}</td>
+                          <td>{formatBalance(session.initialBalance)}</td>
+                          <td>{formatBalance(session.balance)}</td>
+                          <td
+                            className={
+                              session.totalProfit >= 0
+                                ? 'trade-profit-positive'
+                                : 'trade-profit-negative'
+                            }
+                          >
+                            {moneyFormat.format(session.totalProfit)}
+                          </td>
+                          <td>
+                            {resumeButton(session)}
+                            <Button
+                              type="button"
+                              size="icon-xs"
+                              variant="ghost"
+                              aria-label={`Удалить сессию ${session.ticker} от ${dateFormat.format(session.startedAt)}`}
+                              title="Удалить сессию"
+                              disabled={busy || Boolean(resumingId)}
+                              onClick={() => {
+                                setDeletionError(undefined);
+                                setDeleting(session);
+                              }}
+                            >
+                              <Trash2 size={14} />
+                            </Button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="sessions-state">
+                Торговых сессий пока нет. Они появятся после запуска симуляции.
+              </div>
+            )}
+          </TabsContent>
+          <TabsContent value="characteristics" className="min-w-0">
+            <TradeCharacteristicsPage />
+          </TabsContent>
+        </Tabs>
       )}
       <Dialog
         open={Boolean(deleting)}
