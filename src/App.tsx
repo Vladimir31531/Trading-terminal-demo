@@ -32,7 +32,11 @@ import {
   type SimulationSettings,
   validateSimulationSettings,
 } from './domain/simulation';
-import { type TradingSession, validateInitialBalance } from './domain/trading';
+import {
+  type ClosedTrade,
+  type TradingSession,
+  validateInitialBalance,
+} from './domain/trading';
 import { loadChartTimeZone } from './infrastructure/chart-preferences';
 import { marketRepository } from './infrastructure/market-repository';
 import { tradingHistory } from './infrastructure/trading-history';
@@ -343,6 +347,21 @@ export default function App() {
     setTrading(undefined);
   }
 
+  async function deleteTrade(trade: ClosedTrade): Promise<void> {
+    if (sessionOperation.current)
+      throw new Error('Дождитесь завершения текущей операции с сессией.');
+    sessionOperation.current = true;
+    setSessionBusy(true);
+    try {
+      if (trading?.getSnapshot().sessionId === trade.sessionId)
+        await trading.deleteClosedTrade(trade.id);
+      else await tradingHistory.deleteClosedTrade(trade.sessionId, trade.id);
+    } finally {
+      sessionOperation.current = false;
+      setSessionBusy(false);
+    }
+  }
+
   const refresh = useCallback(async (preferredId?: string) => {
     const items = await marketRepository.listInstruments();
     setInstruments(items);
@@ -522,6 +541,7 @@ export default function App() {
             <TradingSessionsPage
               onBack={() => setPage('chart')}
               onBeforeDelete={stopSessionBeforeDelete}
+              onDeleteTrade={deleteTrade}
               savedSimulations={savedSimulations}
               onResume={resumeSimulation}
               resumeDisabled={Boolean(simulation) || sessionBusy}

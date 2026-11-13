@@ -102,6 +102,18 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
   const balanceEntries: BalanceHistoryEntry[] = [];
   const stagedReviews: PendingTradeReview[] = [];
   const history = {
+    async deleteClosedTrade(sessionId: string, tradeId: string) {
+      const index = closedTrades.findIndex(
+        (trade) => trade.id === tradeId && trade.sessionId === sessionId,
+      );
+      if (index === -1) return;
+      const [trade] = closedTrades.splice(index, 1);
+      const entryIndex = balanceEntries.findIndex(
+        (entry) => entry.tradeId === trade.id,
+      );
+      if (entryIndex !== -1) balanceEntries.splice(entryIndex, 1);
+      return trade;
+    },
     async stageClosedTrade(review: PendingTradeReview) {
       if (!stagedReviews.some((item) => item.trade.id === review.trade.id))
         stagedReviews.push(review);
@@ -141,6 +153,123 @@ function createHarness(initialBalance = 1000, sessionId = 'session-1') {
 }
 
 describe('trading calculations and replay execution', () => {
+  test('deletes a realized trade from live balance and markers without changing an open position or counters', async () => {
+    const {
+      simulation,
+      trading,
+      candles,
+      frames,
+      closedTrades,
+      balanceEntries,
+    } = createHarness();
+    candles[1] = { time: 101, open: 100, high: 100.4, low: 100, close: 100.4 };
+    await simulation.start();
+    trading.openMarket('buy', 0.01);
+    const firstOrderId = trading.getSnapshot().orders[0].id;
+    frames.advance(1000);
+    trading.closeOrder(firstOrderId);
+    await approveReviews(trading);
+    expect(trading.getSnapshot().balance).toBeCloseTo(1020);
+    expect(closedTrades[0].orderId).toBe(firstOrderId);
+    trading.openMarket('sell', 0.02);
+    const openOrder = structuredClone(trading.getSnapshot().orders[0]);
+    const deletedId = closedTrades[0].id;
+
+    await trading.deleteClosedTrade(deletedId);
+
+    expect(simulation.getSnapshot().status).toBe('paused');
+    expect(trading.getSnapshot().balance).toBeCloseTo(1000);
+    expect(trading.getSnapshot().orders).toEqual([openOrder]);
+    expect(trading.getSnapshot().markers).toHaveLength(1);
+    expect(trading.getSnapshot().markers[0].orderId).toBe(openOrder.id);
+    expect(closedTrades).toHaveLength(0);
+    expect(balanceEntries).toHaveLength(0);
+    const checkpoint = await trading.checkpoint();
+    expect(checkpoint.balanceSequence).toBe(1);
+    expect(checkpoint.nextTicket).toBe(3);
+    expect(checkpoint.snapshot.markers).toHaveLength(1);
+    await trading.deleteClosedTrade(deletedId);
+    expect(trading.getSnapshot().balance).toBeCloseTo(1000);
+    trading.closeOrder(openOrder.id);
+    await approveReviews(trading);
+    expect(balanceEntries[0].sequence).toBe(2);
+    expect(balanceEntries[0].balance).toBeCloseTo(1000);
+    expect(closedTrades[0].ticket).toBe(2);
+    simulation.destroy();
+  });
+
+  test('retains the trade, balance and markers when deletion storage fails, then retries safely', async () => {
+    const { simulation, trading, history, closedTrades } = createHarness();
+    await simulation.start();
+    simulation.pause();
+    trading.openMarket('buy', 0.01);
+    trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await approveReviews(trading);
+    const original = trading.getSnapshot();
+    const remove = history.deleteClosedTrade;
+    history.deleteClosedTrade = async () => {
+      throw new Error('Storage is unavailable.');
+    };
+    await expect(trading.deleteClosedTrade(closedTrades[0].id)).rejects.toThrow(
+      'Storage is unavailable.',
+    );
+    expect(trading.getSnapshot()).toBe(original);
+    expect(closedTrades).toHaveLength(1);
+    history.deleteClosedTrade = remove;
+    await trading.deleteClosedTrade(closedTrades[0].id);
+    expect(trading.getSnapshot().markers).toHaveLength(0);
+    expect(closedTrades).toHaveLength(0);
+    await trading.checkpoint();
+    simulation.destroy();
+  });
+
+  test('blocks checkpoints and trade changes while a deletion is committing', async () => {
+    const { simulation, trading, history, closedTrades } = createHarness();
+    await simulation.start();
+    simulation.pause();
+    trading.openMarket('buy', 0.01);
+    trading.closeOrder(trading.getSnapshot().orders[0].id);
+    await approveReviews(trading);
+    const remove = history.deleteClosedTrade;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    history.deleteClosedTrade = async (sessionId, id) => {
+      await waiting;
+      return remove(sessionId, id);
+    };
+    const deleting = trading.deleteClosedTrade(closedTrades[0].id);
+    await flush();
+    await expect(trading.checkpoint()).rejects.toThrow(
+      'Дождитесь удаления сделки.',
+    );
+    expect(() => trading.openMarket('sell', 0.01)).toThrow(
+      'Дождитесь удаления сделки.',
+    );
+    await expect(trading.saveTradeReview('other', {})).rejects.toThrow(
+      'Дождитесь удаления сделки.',
+    );
+    release();
+    await deleting;
+    expect((await trading.checkpoint()).snapshot.balance).toBe(1000);
+    simulation.destroy();
+  });
+
+  test('cleans markers from a finished session without reopening it', async () => {
+    const { simulation, trading, closedTrades } = createHarness();
+    await simulation.start();
+    trading.openMarket('buy', 0.01);
+    await trading.finish();
+    await approveReviews(trading);
+    expect(trading.getSnapshot().finished).toBe(true);
+    await trading.deleteClosedTrade(closedTrades[0].id);
+    expect(trading.getSnapshot().finished).toBe(true);
+    expect(trading.getSnapshot().markers).toHaveLength(0);
+    expect(trading.getSnapshot().orders).toHaveLength(0);
+    simulation.destroy();
+  });
+
   test('pauses a manual close and stages its execution without recording history before review', async () => {
     const {
       simulation,

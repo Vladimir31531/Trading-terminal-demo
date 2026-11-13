@@ -1,4 +1,5 @@
 import type { Candle, Instrument } from '../domain/market';
+import { removeClosedTradeFromSnapshot } from '../domain/trade-deletion';
 import {
   type BalanceHistoryEntry,
   type ClosedTrade,
@@ -21,6 +22,10 @@ import {
 import type { SimulationEngine } from './simulation-engine';
 
 interface TradingHistoryWriter {
+  deleteClosedTrade(
+    sessionId: string,
+    tradeId: string,
+  ): Promise<ClosedTrade | undefined>;
   stageClosedTrade(review: PendingTradeReview): Promise<void>;
   saveClosedTrade(
     trade: ClosedTrade,
@@ -41,6 +46,7 @@ export class TradingEngine {
   private simulation?: SimulationEngine;
   private releaseReviewHold?: () => void;
   private savingReview = false;
+  private deletingTrade = false;
   private readonly pendingWrites: (() => Promise<void>)[] = [];
   private writeChain = Promise.resolve();
   private closed = false;
@@ -308,6 +314,7 @@ export class TradingEngine {
     id: string,
     characteristics: Record<string, string>,
   ): Promise<void> {
+    if (this.deletingTrade) throw new Error('Дождитесь удаления сделки.');
     if (this.savingReview) throw new Error('Сделка уже сохраняется.');
     const review = this.snapshot.pendingTradeReviews?.[0];
     if (!review || review.trade.id !== id)
@@ -331,6 +338,26 @@ export class TradingEngine {
       this.publish();
     } finally {
       this.savingReview = false;
+    }
+  }
+
+  async deleteClosedTrade(id: string): Promise<void> {
+    if (this.deletingTrade || this.savingReview)
+      throw new Error('Дождитесь завершения текущего сохранения истории.');
+    this.deletingTrade = true;
+    this.simulation?.pause();
+    const release = this.simulation?.hold();
+    try {
+      await this.flushWrites();
+      if (this.snapshot.error) throw new Error(this.snapshot.error);
+      const trade = await this.history.deleteClosedTrade(this.session.id, id);
+      if (trade) {
+        this.snapshot = removeClosedTradeFromSnapshot(this.snapshot, trade);
+        this.publish();
+      }
+    } finally {
+      this.deletingTrade = false;
+      release?.();
     }
   }
 
@@ -458,6 +485,7 @@ export class TradingEngine {
     );
     const closedTrade: ClosedTrade = {
       id: crypto.randomUUID(),
+      orderId: order.id,
       sessionId: this.session.id,
       ticket: order.ticket,
       instrumentId: order.instrumentId,
@@ -539,6 +567,7 @@ export class TradingEngine {
   }
 
   private assertActive(): void {
+    if (this.deletingTrade) throw new Error('Дождитесь удаления сделки.');
     if (this.closed || this.snapshot.finished)
       throw new Error('Торговая сессия уже завершена.');
     if (this.snapshot.pendingTradeReviews?.length)

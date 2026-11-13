@@ -2,14 +2,14 @@ import { useMemo, useState } from 'react';
 import type { TradeCharacteristic } from '../domain/trade-characteristics';
 import {
   analyzeCustomTradingSession,
-  type CharacteristicFilters,
+  type CharacteristicMultiFilters,
 } from '../domain/trade-filters';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
   TradingSession,
 } from '../domain/trading';
-import { CharacteristicFilterSelect } from './CharacteristicFilterSelect';
+import { CharacteristicMultiFilter } from './CharacteristicMultiFilter';
 import { SessionSummaryView } from './SessionAnalytics';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
@@ -33,7 +33,7 @@ export function CustomSessionAnalytics({
   balanceHistory,
   characteristics,
 }: Props) {
-  const [filters, setFilters] = useState<CharacteristicFilters>({});
+  const [filters, setFilters] = useState<CharacteristicMultiFilters>({});
   const activeFilters = useMemo(
     () =>
       Object.fromEntries(
@@ -75,7 +75,10 @@ export function CustomSessionAnalytics({
   ).length;
   const hasFilters = Object.keys(activeFilters).length > 0;
 
-  function changeFilter(id: string, value: string | null | undefined) {
+  function changeFilter(
+    id: string,
+    value: readonly (string | null)[] | undefined,
+  ) {
     setFilters((current) => {
       const next = { ...current };
       if (value === undefined) delete next[id];
@@ -96,9 +99,11 @@ export function CustomSessionAnalytics({
               Аналитика по характеристикам
             </h3>
             <p className="text-xs text-muted-foreground">
-              Сделка попадает в выборку, если совпадают все выбранные
-              характеристики. «Все значения» снимает ограничение, «-» выбирает
-              сделки без заполненного значения.
+              Выберите одно или несколько значений каждой характеристики.
+              Значения внутри одной характеристики объединяются через «или»,
+              разные характеристики — через «и». «Все значения» снимает
+              ограничение, отсутствие отметок даёт пустую выборку. Пункт «- (без
+              значения)» включает сделки без заполненного значения.
             </p>
           </div>
           <Button
@@ -118,7 +123,7 @@ export function CustomSessionAnalytics({
                 <Label htmlFor={`custom-characteristic-${characteristic.id}`}>
                   {characteristic.name}
                 </Label>
-                <CharacteristicFilterSelect
+                <CharacteristicMultiFilter
                   characteristic={characteristic}
                   idPrefix="custom-characteristic"
                   value={activeFilters[characteristic.id]}

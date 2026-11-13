@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { LoaderCircle, Trash2 } from 'lucide-react';
+import { useRef, useState } from 'react';
 import type { TradeCharacteristic } from '../domain/trade-characteristics';
 import {
   filterTrades,
@@ -12,6 +13,14 @@ import type {
 import { CharacteristicFilterSelect } from './CharacteristicFilterSelect';
 import { TradeDateFilter } from './TradeDateFilter';
 import { Button } from './ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './ui/dialog';
 import { NativeSelect, NativeSelectOption } from './ui/native-select';
 
 const dateFormat = new Intl.DateTimeFormat('ru-RU', {
@@ -32,6 +41,7 @@ interface Props {
   trades: readonly ClosedTrade[];
   balanceHistory: readonly BalanceHistoryEntry[];
   characteristics?: readonly TradeCharacteristic[];
+  onDeleteTrade?: (trade: ClosedTrade) => Promise<void>;
 }
 
 export function TradingSessionHistory(props: Props) {
@@ -43,8 +53,14 @@ function SessionHistory({
   trades,
   balanceHistory,
   characteristics = [],
+  onDeleteTrade,
 }: Props) {
   const [filters, setFilters] = useState<TradeHistoryFilters>({});
+  const [deleting, setDeleting] = useState<ClosedTrade>();
+  const [deletionBusy, setDeletionBusy] = useState(false);
+  const [deletionError, setDeletionError] = useState<string>();
+  const deletionPending = useRef(false);
+  const cancelDeletion = useRef<HTMLButtonElement>(null);
   const tradeTickets = new Map(trades.map((trade) => [trade.id, trade.ticket]));
   const characteristicFilters = Object.fromEntries(
     characteristics.map((item) => [
@@ -88,6 +104,25 @@ function SessionHistory({
       max: trades[0]?.closedAt ?? fallbackTime,
     },
   );
+
+  async function deleteSelectedTrade() {
+    if (!deleting || !onDeleteTrade || deletionPending.current) return;
+    deletionPending.current = true;
+    setDeletionBusy(true);
+    setDeletionError(undefined);
+    try {
+      await onDeleteTrade(deleting);
+      setFilters({});
+      setDeleting(undefined);
+    } catch (cause) {
+      setDeletionError(
+        cause instanceof Error ? cause.message : 'Не удалось удалить сделку.',
+      );
+    } finally {
+      deletionPending.current = false;
+      setDeletionBusy(false);
+    }
+  }
 
   return (
     <div className="session-history">
@@ -237,6 +272,7 @@ function SessionHistory({
                     </div>
                   </th>
                 ))}
+                {onDeleteTrade && <th aria-label="Удаление сделки" />}
               </tr>
             </thead>
             <tbody>
@@ -265,12 +301,32 @@ function SessionHistory({
                       {trade.characteristics?.[characteristic.id] ?? '-'}
                     </td>
                   ))}
+                  {onDeleteTrade && (
+                    <td>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={`Удалить сделку #${trade.ticket}`}
+                        title="Удалить сделку из истории"
+                        disabled={deletionBusy}
+                        onClick={() => {
+                          setDeletionError(undefined);
+                          setDeleting(trade);
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    </td>
+                  )}
                 </tr>
               ))}
               {!filteredTrades.length && (
                 <tr>
                   <td
-                    colSpan={8 + characteristics.length}
+                    colSpan={
+                      8 + characteristics.length + (onDeleteTrade ? 1 : 0)
+                    }
                     className="trading-empty-row"
                   >
                     {trades.length
@@ -327,6 +383,75 @@ function SessionHistory({
           </table>
         </div>
       </section>
+      <Dialog
+        open={Boolean(deleting)}
+        onOpenChange={(open) => {
+          if (!open && !deletionPending.current) setDeleting(undefined);
+        }}
+      >
+        <DialogContent
+          showCloseButton={!deletionBusy}
+          className="bg-white"
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            cancelDeletion.current?.focus();
+          }}
+          onEscapeKeyDown={(event) => {
+            if (deletionPending.current) event.preventDefault();
+          }}
+          onInteractOutside={(event) => {
+            if (deletionPending.current) event.preventDefault();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Удалить сделку из истории?</DialogTitle>
+            <DialogDescription>
+              Сделка и её характеристики будут удалены без возможности
+              восстановления. Баланс и статистика Summary, Profit &amp; Loss и
+              Custom будут пересчитаны. Стрелки и соединяющая их линия этой
+              сделки исчезнут с графика.
+            </DialogDescription>
+          </DialogHeader>
+          {deleting && (
+            <div className="grid gap-1 rounded-md border bg-muted/30 p-3 text-sm">
+              <strong>
+                {deleting.ticker} · #{deleting.ticket} ·{' '}
+                {deleting.side.toUpperCase()} {deleting.kind}
+              </strong>
+              <span>Объём: {priceFormat.format(deleting.volume)} лота</span>
+              <span>Результат: {moneyFormat.format(deleting.profit)} USD</span>
+              <span className="text-xs text-muted-foreground">
+                Закрыта {dateFormat.format(deleting.closedAt * 1000)} UTC
+              </span>
+            </div>
+          )}
+          {deletionError && (
+            <p className="form-error" role="alert">
+              {deletionError}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              ref={cancelDeletion}
+              type="button"
+              variant="outline"
+              disabled={deletionBusy}
+              onClick={() => setDeleting(undefined)}
+            >
+              Отмена
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={deletionBusy}
+              onClick={() => void deleteSelectedTrade()}
+            >
+              {deletionBusy && <LoaderCircle className="size-4 animate-spin" />}
+              {deletionBusy ? 'Удаляем…' : 'Удалить безвозвратно'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

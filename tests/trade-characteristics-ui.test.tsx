@@ -93,6 +93,47 @@ describe('trade characteristic columns', () => {
     expect(html).toContain('Закрытых сделок пока нет');
   });
 
+  test('identifies the delete action by trade ticket without changing saved values', () => {
+    const html = renderToStaticMarkup(
+      <TradingSessionHistory
+        session={session}
+        trades={[
+          trade,
+          {
+            ...trade,
+            id: 'tagged',
+            ticket: 2,
+            characteristics: { setup: 'Отскок', quality: 'A' },
+          },
+        ]}
+        balanceHistory={[]}
+        characteristics={characteristics}
+        onDeleteTrade={async () => undefined}
+      />,
+    );
+    expect(html).toContain('aria-label="Удалить сделку #1"');
+    expect(html).toContain('aria-label="Удалить сделку #2"');
+    expect(html).toContain('aria-label="Удаление сделки"');
+    expect(html).toContain('<td>-</td><td>-</td>');
+    expect(html).toContain('<td>Отскок</td><td>A</td>');
+    expect(html).not.toContain('aria-label="Фильтр: Удаление сделки"');
+  });
+
+  test('includes the delete column in an empty history when deletion is available', () => {
+    const html = renderToStaticMarkup(
+      <TradingSessionHistory
+        session={session}
+        trades={[]}
+        balanceHistory={[]}
+        characteristics={characteristics}
+        onDeleteTrade={async () => undefined}
+      />,
+    );
+    expect(html).toContain('colSpan="11"');
+    expect(html).toContain('Закрытых сделок пока нет');
+    expect(html).not.toContain('aria-label="Удалить сделку #');
+  });
+
   test('provides filters only for dates and text columns while reporting the visible trade count', () => {
     const html = renderToStaticMarkup(
       <TradingSessionHistory

@@ -18,6 +18,11 @@ export type CharacteristicFilters = Readonly<
   Record<string, string | null | undefined>
 >;
 
+/** Undefined selects all values; an empty list selects none. */
+export type CharacteristicMultiFilters = Readonly<
+  Record<string, readonly (string | null)[] | undefined>
+>;
+
 export interface TradeHistoryFilters {
   openedAt?: TradeDateRange;
   closedAt?: TradeDateRange;
@@ -33,12 +38,24 @@ function withinRange(time: number, range?: TradeDateRange): boolean {
   );
 }
 
+function matchesCharacteristics(
+  trade: ClosedTrade,
+  filters: CharacteristicFilters | CharacteristicMultiFilters,
+): boolean {
+  return Object.entries(filters).every(([id, selected]) => {
+    if (selected === undefined) return true;
+    const value = trade.characteristics?.[id] ?? null;
+    return selected === null || typeof selected === 'string'
+      ? selected === value
+      : selected.includes(value);
+  });
+}
+
 /** Date endpoints are inclusive UTC seconds; every active filter must match. */
 export function filterTrades(
   trades: readonly ClosedTrade[],
   filters: TradeHistoryFilters,
 ): ClosedTrade[] {
-  const characteristicFilters = Object.entries(filters.characteristics ?? {});
   return trades.filter(
     (trade) =>
       withinRange(trade.openedAt, filters.openedAt) &&
@@ -47,11 +64,7 @@ export function filterTrades(
         `${trade.side} ${trade.kind}` === filters.type) &&
       (filters.closeReason === undefined ||
         trade.closeReason === filters.closeReason) &&
-      characteristicFilters.every(
-        ([id, value]) =>
-          value === undefined ||
-          (trade.characteristics?.[id] ?? null) === value,
-      ),
+      matchesCharacteristics(trade, filters.characteristics ?? {}),
   );
 }
 
@@ -60,7 +73,7 @@ export function analyzeCustomTradingSession(
   session: TradingSession,
   trades: readonly ClosedTrade[],
   balanceHistory: readonly BalanceHistoryEntry[],
-  filters: CharacteristicFilters,
+  filters: CharacteristicFilters | CharacteristicMultiFilters,
 ): SessionAnalytics {
   const validTrades = trades.filter(
     (trade) =>
@@ -96,7 +109,7 @@ export function analyzeCustomTradingSession(
   };
   return analyzeTradingSession(
     periodSession,
-    filterTrades(validTrades, { characteristics: filters }),
+    validTrades.filter((trade) => matchesCharacteristics(trade, filters)),
     balanceHistory,
     { balanceSource: 'trades' },
   );

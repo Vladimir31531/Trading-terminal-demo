@@ -5,6 +5,10 @@ import {
   type TradeCharacteristic,
   validateTradeCharacteristicSelections,
 } from '../domain/trade-characteristics';
+import {
+  recalculateTradeDeletion,
+  removeClosedTradeFromSnapshot,
+} from '../domain/trade-deletion';
 import type {
   BalanceHistoryEntry,
   ClosedTrade,
@@ -252,6 +256,11 @@ export const tradingHistory = {
           await database.pendingTradeReviews.delete(trade.id);
           return;
         }
+        const pending = await database.pendingTradeReviews.get(trade.id);
+        if (!pending || pending.trade.sessionId !== trade.sessionId)
+          throw new Error(
+            'Сделка уже удалена или больше не ожидает сохранения.',
+          );
         if (trade.characteristics !== undefined)
           validateTradeCharacteristicSelections(
             await database.tradeCharacteristics.toArray(),
@@ -265,6 +274,80 @@ export const tradingHistory = {
           balance: entry.balance,
         });
         await database.pendingTradeReviews.delete(trade.id);
+      },
+    );
+  },
+
+  async deleteClosedTrade(
+    sessionId: string,
+    tradeId: string,
+  ): Promise<ClosedTrade | undefined> {
+    return database.transaction(
+      'rw',
+      database.sessions,
+      database.trades,
+      database.balanceHistory,
+      database.suspendedSimulations,
+      database.pendingTradeReviews,
+      async () => {
+        const removed = await database.trades.get(tradeId);
+        if (!removed || removed.sessionId !== sessionId) return;
+        const session = await database.sessions.get(sessionId);
+        if (!session) throw new Error('Торговая сессия больше не существует.');
+        const [trades, entries, saved, reviews] = await Promise.all([
+          database.trades.where('sessionId').equals(sessionId).toArray(),
+          database.balanceHistory
+            .where('sessionId')
+            .equals(sessionId)
+            .toArray(),
+          database.suspendedSimulations.get(sessionId),
+          database.pendingTradeReviews
+            .where('trade.sessionId')
+            .equals(sessionId)
+            .toArray(),
+        ]);
+        const updated = recalculateTradeDeletion(
+          session,
+          removed,
+          trades.filter((trade) => trade.id !== tradeId),
+          entries,
+        );
+        await database.trades.delete(tradeId);
+        await database.balanceHistory.bulkDelete(
+          entries
+            .filter((entry) => entry.tradeId === tradeId)
+            .map((entry) => entry.id),
+        );
+        if (updated.balanceHistory.length)
+          await database.balanceHistory.bulkPut(updated.balanceHistory);
+        await database.sessions.put(updated.session);
+        await database.pendingTradeReviews.delete(tradeId);
+        const remainingReviews = reviews
+          .filter((review) => review.trade.id !== tradeId)
+          .map((review) => ({
+            ...review,
+            balanceEntry: {
+              ...review.balanceEntry,
+              balance: review.balanceEntry.balance - removed.profit,
+            },
+          }));
+        if (remainingReviews.length)
+          await database.pendingTradeReviews.bulkPut(remainingReviews);
+        if (saved) {
+          await database.suspendedSimulations.put({
+            ...saved,
+            trading: {
+              ...saved.trading,
+              snapshot: removeClosedTradeFromSnapshot(
+                saved.trading.snapshot,
+                removed,
+              ),
+            },
+            // A prepared resume must not claim its now-stale snapshot.
+            savedAt: Math.max(Date.now(), saved.savedAt + 1),
+          });
+        }
+        return removed;
       },
     );
   },

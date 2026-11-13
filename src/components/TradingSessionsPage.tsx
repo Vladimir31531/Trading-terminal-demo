@@ -39,6 +39,7 @@ interface Props {
   savedSimulations: readonly SavedSimulation[];
   onResume: (sessionId: string) => Promise<void>;
   resumeDisabled?: boolean;
+  onDeleteTrade?: (trade: ClosedTrade) => Promise<void>;
 }
 
 export function TradingSessionsPage({
@@ -47,6 +48,7 @@ export function TradingSessionsPage({
   savedSimulations,
   onResume,
   resumeDisabled = false,
+  onDeleteTrade,
 }: Props) {
   const [sessions, setSessions] = useState<TradingSessionSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
@@ -299,6 +301,7 @@ export function TradingSessionsPage({
                 trades={trades}
                 balanceHistory={balanceHistory}
                 characteristics={characteristics}
+                onDeleteTrade={onDeleteTrade}
               />
             </TabsContent>
             <TabsContent value="summary" className="session-tab-content">

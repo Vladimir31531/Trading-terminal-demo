@@ -28,6 +28,8 @@ export interface TradeOrder {
 
 export interface ClosedTrade {
   id: string;
+  /** Missing on trades recorded before stable order/marker linkage was added. */
+  orderId?: string;
   sessionId: string;
   ticket: number;
   instrumentId: string;

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { analyzeTradingSession } from '../src/domain/session-analytics';
 import {
   analyzeCustomTradingSession,
+  type CharacteristicMultiFilters,
   filterTrades,
 } from '../src/domain/trade-filters';
 import type {
@@ -352,5 +353,167 @@ describe('custom trade characteristic analytics', () => {
         .netProfit,
     ).toBe(120);
     expect(source).toEqual(original);
+  });
+});
+
+describe('Custom characteristic multiselects', () => {
+  const trades = [
+    trade(1, {
+      profit: 100,
+      characteristics: { setup: 'A', direction: 'Trend' },
+    }),
+    trade(2, {
+      profit: -50,
+      characteristics: { setup: 'B', direction: 'Trend' },
+    }),
+    trade(3, {
+      profit: 20,
+      characteristics: { setup: 'C', direction: 'Countertrend' },
+    }),
+    trade(4, { profit: -10 }),
+    trade(5, {
+      profit: 5,
+      characteristics: { setup: '-', direction: 'Trend' },
+    }),
+    trade(6, {
+      profit: 0,
+      characteristics: { setup: 'A', direction: 'Countertrend' },
+    }),
+  ];
+  const history = historyFor(trades);
+
+  test('combines selected values of one characteristic through OR', () => {
+    const selected = analyzeCustomTradingSession(session, trades, history, {
+      setup: ['A', 'B'],
+    });
+    expect(selected.trades.map((item) => item.ticket)).toEqual([1, 2, 6]);
+    expect(selected).toMatchObject({
+      totalTrades: 3,
+      wins: 1,
+      losses: 1,
+      breakeven: 1,
+      netProfit: 50,
+      endingBalance: 1050,
+    });
+  });
+
+  test('combines different characteristic multiselects through AND', () => {
+    const selected = analyzeCustomTradingSession(session, trades, history, {
+      setup: ['A', 'B'],
+      direction: ['Trend'],
+    });
+    expect(selected.trades.map((item) => item.ticket)).toEqual([1, 2]);
+    expect(
+      analyzeCustomTradingSession(session, trades, history, {
+        setup: ['A', 'C'],
+        direction: ['Countertrend', 'Sideways'],
+      }).trades.map((item) => item.ticket),
+    ).toEqual([3, 6]);
+  });
+
+  test('selecting none in any characteristic yields an empty sample', () => {
+    const selected = analyzeCustomTradingSession(session, trades, history, {
+      setup: ['A', 'B', null],
+      direction: [],
+    });
+    expect(selected).toMatchObject({
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      breakeven: 0,
+      netProfit: 0,
+      endingBalance: 1000,
+      maxDrawdown: 0,
+    });
+    expect(selected.balanceSeries).toHaveLength(1);
+    expect(selected.sharpeRatio).toBeUndefined();
+  });
+
+  test('all values retains trades with missing or legacy characteristic values', () => {
+    const filters: CharacteristicMultiFilters = {
+      setup: undefined,
+      direction: undefined,
+    };
+    const all = analyzeCustomTradingSession(session, trades, history, filters);
+    expect(all.trades).toEqual(trades);
+    expect(all).toEqual(
+      analyzeCustomTradingSession(session, trades, history, {}),
+    );
+    expect(all).toEqual(analyzeTradingSession(session, trades, history));
+  });
+
+  test('a mixed selection can include missing values and named values without conflating a literal dash', () => {
+    const selected = analyzeCustomTradingSession(session, trades, history, {
+      setup: [null, 'A'],
+    });
+    expect(selected.trades.map((item) => item.ticket)).toEqual([1, 4, 6]);
+    expect(selected.endingBalance).toBe(1090);
+    expect(
+      analyzeCustomTradingSession(session, trades, history, {
+        setup: ['-'],
+      }).trades.map((item) => item.ticket),
+    ).toEqual([5]);
+    expect(
+      analyzeCustomTradingSession(session, trades, history, {
+        setup: [null, '-'],
+      }).trades.map((item) => item.ticket),
+    ).toEqual([4, 5]);
+  });
+
+  test('literal option labels never act as all or missing sentinels', () => {
+    const labelled = [
+      trade(1),
+      trade(2, { characteristics: { setup: 'all' } }),
+      trade(3, { characteristics: { setup: 'missing' } }),
+      trade(4, { characteristics: { setup: 'Все значения' } }),
+    ];
+    const selected = analyzeCustomTradingSession(session, labelled, [], {
+      setup: ['all', 'missing'],
+    });
+    expect(selected.trades.map((item) => item.ticket)).toEqual([2, 3]);
+  });
+
+  test('recalculates balance and drawdown from only the selected executions', () => {
+    const executions = [
+      trade(1, { profit: 100, characteristics: { setup: 'A' } }),
+      trade(2, { profit: 1000, characteristics: { setup: 'Excluded' } }),
+      trade(3, { profit: -40, characteristics: { setup: 'B' } }),
+      trade(4, { profit: 10, characteristics: { setup: 'A' } }),
+    ];
+    const balances = historyFor(executions);
+    const selected = analyzeCustomTradingSession(
+      session,
+      executions,
+      balances,
+      { setup: ['A', 'B'] },
+    );
+    expect(selected).toMatchObject({
+      totalTrades: 3,
+      netProfit: 70,
+      endingBalance: 1070,
+      maxDrawdown: 40,
+    });
+    expect(selected.balanceSeries.map((point) => point.balance)).toEqual([
+      1000, 1100, 1060, 1070,
+    ]);
+    expect(selected.monthly[0].total).toBe(70);
+    expect(balances.at(-1)?.balance).toBe(2070);
+  });
+
+  test('duplicate choices do not duplicate executions and read-only inputs are not changed', () => {
+    const choices = Object.freeze(['A', 'A', null] as const);
+    const filters: CharacteristicMultiFilters = Object.freeze({
+      setup: choices,
+    });
+    const original = structuredClone({ trades, history, filters });
+    const selected = analyzeCustomTradingSession(
+      session,
+      trades,
+      history,
+      filters,
+    );
+    expect(selected.trades.map((item) => item.ticket)).toEqual([1, 4, 6]);
+    expect({ trades, history, filters }).toEqual(original);
+    expect(choices).toEqual(['A', 'A', null]);
   });
 });
